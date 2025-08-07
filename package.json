@@ -1,0 +1,19 @@
+{
+  "name": "voxel-art-editor",
+  "version": "1.0.0",
+  "description": "A 3D voxel art scene editor built with Electron",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev"
+  },
+  "keywords": ["electron", "voxel", "3d", "editor"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^27.0.0"
+  },
+  "dependencies": {
+    "three": "^0.158.0"
+  }
+}

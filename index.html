@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voxel Art Editor</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="app">
+        <div id="toolbar">
+            <button id="selectBtn" class="tool-btn active">Select</button>
+            <button id="saveStructureBtn" class="tool-btn">Save Structure</button>
+            <button id="loadStructureBtn" class="tool-btn">Load Structure</button>
+            <div class="separator"></div>
+            <span class="info-text">Click to select/deselect • Hold Shift to show extend gizmo • Space to clear all</span>
+        </div>
+        
+        <div id="scene-container"></div>
+        
+        <div id="structures-menu">
+            <div class="menu-header">Saved Structures</div>
+            <div id="structures-list"></div>
+        </div>
+    </div>
+
+    <script src="renderer.js"></script>
+</body>
+</html>
