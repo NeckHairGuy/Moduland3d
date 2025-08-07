@@ -15,7 +15,8 @@ let voxels = [];
 let selectedVoxels = [];
 let savedStructures = [];
 let currentTool = 'select';
-let gridSize = 20;
+let gridSizeX = 20;
+let gridSizeZ = 20;
 let voxelSize = 1;
 let gizmoGroup;
 let activeGizmo = null;
@@ -26,6 +27,10 @@ let previewGroup;
 let dragAxis = null;
 let dragDirection = 1;
 let shiftPressed = false;
+let heightLimit = 20;
+let focusMode = false;
+let focusedStructure = null;
+let focusedStructureVoxels = new Set();
 
 function init() {
     if (!THREE) {
@@ -93,10 +98,15 @@ function init() {
 }
 
 function createGroundGrid() {
-    const gridHelper = new THREE.GridHelper(gridSize, gridSize, 0x888888, 0xcccccc);
+    // Clear existing grid
+    clearGroundGrid();
+    
+    const maxGridSize = Math.max(gridSizeX, gridSizeZ);
+    const gridHelper = new THREE.GridHelper(maxGridSize, maxGridSize, 0x888888, 0xcccccc);
+    gridHelper.userData.isGridHelper = true;
     scene.add(gridHelper);
     
-    const planeGeometry = new THREE.PlaneGeometry(gridSize, gridSize);
+    const planeGeometry = new THREE.PlaneGeometry(maxGridSize, maxGridSize);
     const planeMaterial = new THREE.MeshBasicMaterial({ 
         color: 0xffffff, 
         opacity: 0.1, 
@@ -106,12 +116,14 @@ function createGroundGrid() {
     const plane = new THREE.Mesh(planeGeometry, planeMaterial);
     plane.rotation.x = -Math.PI / 2;
     plane.receiveShadow = true;
+    plane.userData.isGridPlane = true;
     scene.add(plane);
     
-    for (let x = 0; x < gridSize; x++) {
+    groundGrid = [];
+    for (let x = 0; x < gridSizeX; x++) {
         groundGrid[x] = [];
-        for (let z = 0; z < gridSize; z++) {
-            const geometry = new THREE.BoxGeometry(voxelSize * 0.9, voxelSize * 0.9, voxelSize * 0.9);
+        for (let z = 0; z < gridSizeZ; z++) {
+            const geometry = new THREE.BoxGeometry(voxelSize, voxelSize, voxelSize);
             const material = new THREE.MeshPhongMaterial({ 
                 color: 0xe0e0e0,
                 emissive: 0x000000,
@@ -119,17 +131,59 @@ function createGroundGrid() {
             });
             const cube = new THREE.Mesh(geometry, material);
             cube.position.set(
-                Math.floor(x - gridSize / 2 + 0.5),
+                Math.floor(x - gridSizeX / 2 + 0.5),
                 0,
-                Math.floor(z - gridSize / 2 + 0.5)
+                Math.floor(z - gridSizeZ / 2 + 0.5)
             );
-            cube.userData = { gridX: x, gridZ: z, type: 'ground', selected: false };
+            cube.userData = { gridX: x, gridZ: z, type: 'ground', selected: false, baseColor: 0xe0e0e0 };
             cube.castShadow = true;
             cube.receiveShadow = true;
+            
+            // Add edge highlights
+            const edges = new THREE.EdgesGeometry(geometry);
+            const edgeMaterial = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 1 });
+            const edgeLines = new THREE.LineSegments(edges, edgeMaterial);
+            edgeLines.position.copy(cube.position);
+            cube.userData.edges = edgeLines;
+            scene.add(edgeLines);
+            
+            // Apply height-based coloring
+            updateVoxelColor(cube);
+            
             scene.add(cube);
             groundGrid[x][z] = cube;
         }
     }
+}
+
+function clearGroundGrid() {
+    // Remove existing grid voxels
+    if (groundGrid.length > 0) {
+        groundGrid.flat().forEach(voxel => {
+            if (voxel) {
+                scene.remove(voxel);
+                
+                // Remove edges if they exist
+                if (voxel.userData.edges) {
+                    scene.remove(voxel.userData.edges);
+                    if (voxel.userData.edges.geometry) voxel.userData.edges.geometry.dispose();
+                    if (voxel.userData.edges.material) voxel.userData.edges.material.dispose();
+                }
+                
+                voxel.geometry.dispose();
+                voxel.material.dispose();
+            }
+        });
+    }
+    
+    // Remove grid helper and plane
+    scene.children.filter(child => 
+        child.userData.isGridHelper || child.userData.isGridPlane
+    ).forEach(child => {
+        scene.remove(child);
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) child.material.dispose();
+    });
 }
 
 function setupControls() {
@@ -150,29 +204,56 @@ function setupControls() {
     });
     
     let isRotating = false;
+    let isPanning = false;
     let previousMousePosition = { x: 0, y: 0 };
+    let cameraTarget = new THREE.Vector3(0, 0, 0);
     
     renderer.domElement.addEventListener('mousedown', (event) => {
         if (event.button === 2) {
-            isRotating = true;
+            if (shiftPressed) {
+                isPanning = true;
+            } else {
+                isRotating = true;
+            }
             previousMousePosition = { x: event.clientX, y: event.clientY };
         }
     });
     
     renderer.domElement.addEventListener('mousemove', (event) => {
-        if (isRotating) {
+        if (isRotating && !isPanning) {
             const deltaX = event.clientX - previousMousePosition.x;
             const deltaY = event.clientY - previousMousePosition.y;
             
             const rotationSpeed = 0.005;
             const spherical = new THREE.Spherical();
-            spherical.setFromVector3(camera.position);
+            spherical.setFromVector3(camera.position.clone().sub(cameraTarget));
             spherical.theta -= deltaX * rotationSpeed;
             spherical.phi += deltaY * rotationSpeed;
             spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi));
             
-            camera.position.setFromSpherical(spherical);
-            camera.lookAt(0, 0, 0);
+            camera.position.setFromSpherical(spherical).add(cameraTarget);
+            camera.lookAt(cameraTarget);
+            
+            previousMousePosition = { x: event.clientX, y: event.clientY };
+        } else if (isPanning) {
+            const deltaX = event.clientX - previousMousePosition.x;
+            const deltaY = event.clientY - previousMousePosition.y;
+            
+            const panSpeed = 0.02;
+            const right = new THREE.Vector3();
+            const up = new THREE.Vector3();
+            
+            camera.getWorldDirection(right);
+            right.cross(camera.up).normalize();
+            up.copy(camera.up);
+            
+            const panVector = new THREE.Vector3();
+            panVector.addScaledVector(right, -deltaX * panSpeed);
+            panVector.addScaledVector(up, deltaY * panSpeed);
+            
+            camera.position.add(panVector);
+            cameraTarget.add(panVector);
+            camera.lookAt(cameraTarget);
             
             previousMousePosition = { x: event.clientX, y: event.clientY };
         }
@@ -180,6 +261,7 @@ function setupControls() {
     
     renderer.domElement.addEventListener('mouseup', () => {
         isRotating = false;
+        isPanning = false;
     });
     
     renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -210,6 +292,12 @@ function setupEventListeners() {
             event.preventDefault();
             clearSelection();
             hideGizmos();
+        } else if (event.key === 'f' || event.key === 'F') {
+            event.preventDefault();
+            toggleFocusMode();
+        } else if (event.key === 'Delete' || event.key === 'Backspace') {
+            event.preventDefault();
+            deleteSelectedVoxels();
         }
     });
     
@@ -221,6 +309,41 @@ function setupEventListeners() {
             }
         }
     });
+    
+    // Grid size slider events
+    const gridXSlider = document.getElementById('gridXSlider');
+    const gridXValue = document.getElementById('gridXValue');
+    const gridZSlider = document.getElementById('gridZSlider');
+    const gridZValue = document.getElementById('gridZValue');
+    
+    gridXSlider.addEventListener('input', (event) => {
+        gridSizeX = parseInt(event.target.value);
+        gridXValue.textContent = gridSizeX;
+        createGroundGrid();
+        clearSelection();
+        hideGizmos();
+    });
+    
+    gridZSlider.addEventListener('input', (event) => {
+        gridSizeZ = parseInt(event.target.value);
+        gridZValue.textContent = gridSizeZ;
+        createGroundGrid();
+        clearSelection();
+        hideGizmos();
+    });
+    
+    // Height slider events
+    const heightSlider = document.getElementById('heightSlider');
+    const heightValue = document.getElementById('heightValue');
+    
+    heightSlider.addEventListener('input', (event) => {
+        heightLimit = parseInt(event.target.value);
+        heightValue.textContent = heightLimit;
+        updateAllVoxelColors();
+    });
+    
+    // Buildify menu events
+    setupBuildifyEvents();
 }
 
 function updateToolButtons() {
@@ -401,6 +524,331 @@ function hideGizmos() {
     }
 }
 
+function getHeightBasedColor(baseColor, yPosition) {
+    // Calculate darkness factor based on Y position (0 at ground, 1 at heightLimit)
+    const heightFactor = Math.max(0, Math.min(1, yPosition / heightLimit));
+    
+    // Convert hex color to RGB
+    const color = new THREE.Color(baseColor);
+    
+    // Apply darkness factor (multiply by 1 - heightFactor)
+    const darkness = 1 - heightFactor;
+    color.multiplyScalar(darkness);
+    
+    return color;
+}
+
+function updateVoxelColor(voxel) {
+    const baseColor = voxel.userData.baseColor || 0xe0e0e0;
+    const newColor = getHeightBasedColor(baseColor, voxel.position.y);
+    voxel.material.color.copy(newColor);
+}
+
+function updateAllVoxelColors() {
+    // Update ground grid colors
+    groundGrid.flat().forEach(voxel => {
+        updateVoxelColor(voxel);
+    });
+    
+    // Update created voxel colors
+    voxels.forEach(voxel => {
+        updateVoxelColor(voxel);
+    });
+}
+
+function toggleFocusMode() {
+    if (!focusMode) {
+        // Enter focus mode - only allow if a structure is loaded
+        if (!focusedStructure) {
+            alert('Load a saved structure first to enter focus mode!');
+            return;
+        }
+        
+        enterFocusMode();
+    } else {
+        // Exit focus mode
+        exitFocusMode();
+    }
+}
+
+function enterFocusMode() {
+    focusMode = true;
+    
+    // Initialize the focused structure voxels set with current structure voxels
+    focusedStructureVoxels.clear();
+    
+    // Find all voxels that belong to the focused structure
+    focusedStructure.data.forEach(voxelData => {
+        const targetPos = new THREE.Vector3().fromArray(voxelData.position);
+        targetPos.x = Math.round(targetPos.x);
+        targetPos.y = Math.round(targetPos.y);
+        targetPos.z = Math.round(targetPos.z);
+        
+        const allObjects = [...groundGrid.flat(), ...voxels];
+        const matchingVoxel = allObjects.find(voxel => {
+            const voxelPos = voxel.position;
+            return Math.abs(voxelPos.x - targetPos.x) < 0.1 && 
+                   Math.abs(voxelPos.y - targetPos.y) < 0.1 && 
+                   Math.abs(voxelPos.z - targetPos.z) < 0.1;
+        });
+        
+        if (matchingVoxel) {
+            focusedStructureVoxels.add(matchingVoxel);
+        }
+    });
+    
+    // Select all structure voxels
+    clearSelection();
+    focusedStructureVoxels.forEach(voxel => {
+        toggleSelection(voxel);
+    });
+    
+    // Update visibility - hide all non-structure voxels
+    updateFocusModeVisibility();
+    
+    // Show focus indicator
+    const indicator = document.getElementById('focusIndicator');
+    indicator.style.display = 'block';
+    
+    // Show Buildify menu
+    const buildifyMenu = document.getElementById('buildify-menu');
+    buildifyMenu.style.display = 'flex';
+    
+    console.log('Entered focus mode for structure:', focusedStructure.name);
+}
+
+function exitFocusMode() {
+    focusMode = false;
+    
+    // Update the focused structure with all current structure voxels
+    updateFocusedStructure();
+    
+    // Restore all voxels to full visibility
+    const allVoxels = [...groundGrid.flat(), ...voxels];
+    allVoxels.forEach(voxel => {
+        voxel.visible = true;
+        
+        // Also restore edge visibility
+        if (voxel.userData.edges) {
+            voxel.userData.edges.visible = true;
+        }
+    });
+    
+    // Hide focus indicator
+    const indicator = document.getElementById('focusIndicator');
+    indicator.style.display = 'none';
+    
+    // Hide Buildify menu
+    const buildifyMenu = document.getElementById('buildify-menu');
+    buildifyMenu.style.display = 'none';
+    
+    // Keep structure voxels selected
+    clearSelection();
+    focusedStructureVoxels.forEach(voxel => {
+        toggleSelection(voxel);
+    });
+    
+    console.log('Exited focus mode, updated structure with', focusedStructureVoxels.size, 'voxels');
+}
+
+function updateFocusModeVisibility() {
+    if (!focusMode) return;
+    
+    const allVoxels = [...groundGrid.flat(), ...voxels];
+    allVoxels.forEach(voxel => {
+        // Show only voxels that are part of the focused structure
+        const isVisible = focusedStructureVoxels.has(voxel);
+        voxel.visible = isVisible;
+        
+        // Also update edge visibility
+        if (voxel.userData.edges) {
+            voxel.userData.edges.visible = isVisible;
+        }
+    });
+}
+
+function addVoxelToFocusedStructure(voxel) {
+    if (focusMode && voxel && !focusedStructureVoxels.has(voxel)) {
+        focusedStructureVoxels.add(voxel);
+        voxel.visible = true;
+        
+        // Also make edges visible
+        if (voxel.userData.edges) {
+            voxel.userData.edges.visible = true;
+        }
+    }
+}
+
+function updateFocusedStructure() {
+    if (!focusedStructure || focusedStructureVoxels.size === 0) return;
+    
+    // Update the structure data with all focused structure voxels
+    const structureData = Array.from(focusedStructureVoxels).map(voxel => ({
+        position: voxel.position.toArray(),
+        color: voxel.userData.baseColor || voxel.material.color.getHex(),
+        size: voxelSize
+    }));
+    
+    focusedStructure.data = structureData;
+    
+    // Find and update in savedStructures array
+    const structureIndex = savedStructures.findIndex(s => s.id === focusedStructure.id);
+    if (structureIndex !== -1) {
+        savedStructures[structureIndex] = focusedStructure;
+        updateStructuresMenu();
+    }
+}
+
+function deleteSelectedVoxels() {
+    if (selectedVoxels.length === 0) return;
+    
+    // Can't delete ground grid voxels
+    const voxelsToDelete = selectedVoxels.filter(voxel => voxel.userData.type !== 'ground');
+    
+    if (voxelsToDelete.length === 0) {
+        console.log('Cannot delete ground grid voxels');
+        return;
+    }
+    
+    voxelsToDelete.forEach(voxel => {
+        // Remove from scene
+        scene.remove(voxel);
+        
+        // Remove edges if they exist
+        if (voxel.userData.edges) {
+            scene.remove(voxel.userData.edges);
+            if (voxel.userData.edges.geometry) voxel.userData.edges.geometry.dispose();
+            if (voxel.userData.edges.material) voxel.userData.edges.material.dispose();
+        }
+        
+        // Dispose of geometry and material
+        if (voxel.geometry) voxel.geometry.dispose();
+        if (voxel.material) voxel.material.dispose();
+        
+        // Remove from voxels array
+        const voxelIndex = voxels.indexOf(voxel);
+        if (voxelIndex > -1) {
+            voxels.splice(voxelIndex, 1);
+        }
+        
+        // Remove from focused structure if in focus mode
+        if (focusMode && focusedStructureVoxels.has(voxel)) {
+            focusedStructureVoxels.delete(voxel);
+        }
+        
+        // Remove from selected voxels
+        const selectedIndex = selectedVoxels.indexOf(voxel);
+        if (selectedIndex > -1) {
+            selectedVoxels.splice(selectedIndex, 1);
+        }
+    });
+    
+    // Update gizmos after deletion
+    updateGizmos();
+    
+    console.log('Deleted', voxelsToDelete.length, 'voxels');
+}
+
+function setupBuildifyEvents() {
+    const closeBuildify = document.getElementById('closeBuildify');
+    const detailSlider = document.getElementById('detailLevel');
+    const detailValue = document.getElementById('detailValue');
+    const generateBtn = document.getElementById('generateModel');
+    const previewBtn = document.getElementById('previewModel');
+    const resetBtn = document.getElementById('resetModel');
+    
+    // Close button
+    closeBuildify.addEventListener('click', () => {
+        const buildifyMenu = document.getElementById('buildify-menu');
+        buildifyMenu.style.display = 'none';
+    });
+    
+    // Detail level slider
+    detailSlider.addEventListener('input', (event) => {
+        detailValue.textContent = event.target.value;
+    });
+    
+    // Generate model button
+    generateBtn.addEventListener('click', () => {
+        generateBuildifyModel();
+    });
+    
+    // Preview button
+    previewBtn.addEventListener('click', () => {
+        previewBuildifyModel();
+    });
+    
+    // Reset button
+    resetBtn.addEventListener('click', () => {
+        resetBuildifyModel();
+    });
+}
+
+function generateBuildifyModel() {
+    const description = document.getElementById('modelDescription').value;
+    const detailLevel = document.getElementById('detailLevel').value;
+    const resolution = document.getElementById('voxelResolution').value;
+    const colorPalette = document.getElementById('colorPalette').value;
+    const style = document.getElementById('buildStyle').value;
+    const preserveStructure = document.getElementById('preserveStructure').checked;
+    const smoothEdges = document.getElementById('smoothEdges').checked;
+    const addDetails = document.getElementById('addDetails').checked;
+    
+    if (!description.trim()) {
+        alert('Please enter a model description');
+        return;
+    }
+    
+    // Show progress
+    const progress = document.getElementById('buildifyProgress');
+    progress.style.display = 'block';
+    
+    // Simulate generation process
+    simulateGeneration();
+    
+    console.log('Generating model with settings:', {
+        description,
+        detailLevel,
+        resolution,
+        colorPalette,
+        style,
+        preserveStructure,
+        smoothEdges,
+        addDetails
+    });
+}
+
+function previewBuildifyModel() {
+    console.log('Previewing model...');
+    // TODO: Implement preview functionality
+}
+
+function resetBuildifyModel() {
+    console.log('Resetting model...');
+    // TODO: Implement reset functionality
+}
+
+function simulateGeneration() {
+    const progressFill = document.querySelector('.progress-fill');
+    const progressText = document.querySelector('.progress-text');
+    let progress = 0;
+    
+    const interval = setInterval(() => {
+        progress += Math.random() * 15;
+        if (progress >= 100) {
+            progress = 100;
+            clearInterval(interval);
+            progressText.textContent = 'Complete!';
+            setTimeout(() => {
+                document.getElementById('buildifyProgress').style.display = 'none';
+                progressFill.style.width = '0%';
+                progressText.textContent = 'Generating...';
+            }, 2000);
+        }
+        progressFill.style.width = progress + '%';
+    }, 200);
+}
+
 function updateGizmos() {
     if (shiftPressed && selectedVoxels.length > 0) {
         createGizmos();
@@ -434,7 +882,7 @@ function updateDragPreview(event) {
     
     selectedVoxels.forEach(voxel => {
         for (let i = 1; i <= extendAmount; i++) {
-            const geometry = new THREE.BoxGeometry(voxelSize * 0.9, voxelSize * 0.9, voxelSize * 0.9);
+            const geometry = new THREE.BoxGeometry(voxelSize, voxelSize, voxelSize);
             const edges = new THREE.EdgesGeometry(geometry);
             const line = new THREE.LineSegments(
                 edges,
@@ -485,9 +933,10 @@ function finishGizmoDrag() {
     
     selectedVoxels.forEach(voxel => {
         for (let i = 1; i <= extendAmount; i++) {
-            const geometry = new THREE.BoxGeometry(voxelSize * 0.9, voxelSize * 0.9, voxelSize * 0.9);
+            const geometry = new THREE.BoxGeometry(voxelSize, voxelSize, voxelSize);
+            const baseColor = voxel.userData.baseColor || new THREE.Color().setHSL(Math.random(), 0.5, 0.6).getHex();
             const material = new THREE.MeshPhongMaterial({ 
-                color: voxel.material.color.clone(),
+                color: baseColor,
                 emissive: 0x000000,
                 emissiveIntensity: 0
             });
@@ -505,14 +954,30 @@ function finishGizmoDrag() {
             cube.position.copy(position);
             cube.userData = { 
                 type: 'voxel',
-                selected: false
+                selected: false,
+                baseColor: baseColor
             };
+            
+            // Add edge highlights
+            const edges = new THREE.EdgesGeometry(geometry);
+            const edgeMaterial = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 1 });
+            const edgeLines = new THREE.LineSegments(edges, edgeMaterial);
+            edgeLines.position.copy(cube.position);
+            cube.userData.edges = edgeLines;
+            scene.add(edgeLines);
+            
+            // Apply height-based coloring
+            updateVoxelColor(cube);
+            
             cube.castShadow = true;
             cube.receiveShadow = true;
             
             scene.add(cube);
             voxels.push(cube);
             newVoxels.push(cube);
+            
+            // Add to focused structure if in focus mode
+            addVoxelToFocusedStructure(cube);
         }
     });
     
@@ -587,31 +1052,34 @@ function updateStructuresMenu() {
 function loadStructure(structure) {
     clearSelection();
     
+    // Set this as the focused structure (for potential focus mode)
+    focusedStructure = structure;
+    
+    // Find existing voxels that match the saved structure positions
     structure.data.forEach(voxelData => {
-        const geometry = new THREE.BoxGeometry(voxelData.size * 0.9, voxelData.size * 0.9, voxelData.size * 0.9);
-        const material = new THREE.MeshPhongMaterial({ 
-            color: voxelData.color,
-            emissive: 0x000000,
-            emissiveIntensity: 0
+        const targetPos = new THREE.Vector3().fromArray(voxelData.position);
+        targetPos.x = Math.round(targetPos.x);
+        targetPos.y = Math.round(targetPos.y);
+        targetPos.z = Math.round(targetPos.z);
+        
+        // Search through all existing voxels (ground grid and created voxels)
+        const allObjects = [...groundGrid.flat(), ...voxels];
+        const matchingVoxel = allObjects.find(voxel => {
+            const voxelPos = voxel.position;
+            return Math.abs(voxelPos.x - targetPos.x) < 0.1 && 
+                   Math.abs(voxelPos.y - targetPos.y) < 0.1 && 
+                   Math.abs(voxelPos.z - targetPos.z) < 0.1;
         });
-        const cube = new THREE.Mesh(geometry, material);
         
-        cube.position.fromArray(voxelData.position);
-        cube.position.x = Math.round(cube.position.x);
-        cube.position.y = Math.round(cube.position.y + 5);
-        cube.position.z = Math.round(cube.position.z);
-        
-        cube.userData = { 
-            type: 'voxel',
-            selected: false
-        };
-        cube.castShadow = true;
-        cube.receiveShadow = true;
-        
-        scene.add(cube);
-        voxels.push(cube);
-        toggleSelection(cube);
+        if (matchingVoxel) {
+            toggleSelection(matchingVoxel);
+        }
     });
+    
+    // Update gizmos if shift is pressed
+    if (shiftPressed && selectedVoxels.length > 0) {
+        createGizmos();
+    }
 }
 
 function onWindowResize() {
