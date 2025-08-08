@@ -202,6 +202,10 @@ body {
     margin-bottom: 20px;
 }
 
+.buildify-section .buildify-btn + .buildify-btn {
+    margin-left: 8px;
+}
+
 .buildify-section label {
     display: block;
     color: #bbb;
@@ -210,6 +214,17 @@ body {
     text-transform: uppercase;
     margin-bottom: 8px;
     letter-spacing: 0.5px;
+}
+
+.buildify-input {
+    width: 100%;
+    background: #3a3a3a;
+    border: 1px solid #4a4a4a;
+    color: #fff;
+    padding: 10px;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 14px;
 }
 
 .buildify-section textarea {
@@ -369,6 +384,36 @@ body {
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
 }
 
+#scene-container {
+    flex: 1;
+    position: relative;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+.transform-hud {
+    position: absolute;
+    bottom: 16px;
+    left: 16px;
+    display: flex;
+    gap: 8px;
+    background: rgba(0,0,0,0.5);
+    padding: 6px 8px;
+    border-radius: 6px;
+    z-index: 10;
+}
+
+.hud-btn {
+    padding: 6px 10px;
+    background: #4444ff;
+    border: 1px solid #5555ff;
+    color: #fff;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.hud-btn:hover { background: #5555ff; }
+
 #scene-container canvas {
     display: block;
     width: 100% !important;
@@ -458,18 +503,39 @@ body {
 }
 
 .capture-item {
-    background: #3a3a3a;
-    border: 1px solid #4a4a4a;
+    background: #ffffff;
+    border: 1px solid #e6e6e6;
     border-radius: 6px;
     padding: 10px;
 }
 
+.capture-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+}
+
 .capture-label {
     font-size: 12px;
-    color: #bbb;
+    color: #333;
     margin-bottom: 6px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
+}
+
+.download-btn {
+    padding: 6px 10px;
+    background: #4444ff;
+    color: #fff;
+    border: 1px solid #5555ff;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.download-btn:hover {
+    background: #5555ff;
 }
 
 .capture-img {
@@ -477,5 +543,6 @@ body {
     height: auto;
     display: block;
     border-radius: 4px;
-    background: #222;
+    background: #ffffff;
+    border: 1px solid #e6e6e6;
 }

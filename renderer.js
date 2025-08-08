@@ -37,6 +37,11 @@ let focusedStructureVoxels = new Set();
 let buildingInstanceGroup = null;
 let originalStructureSnapshot = null;
 let renderBuildingEnabled = false;
+let __envLoaded = false;
+let tripoModelGroup = null;
+let tripoPlacementEnabled = false;
+let cachedTripoGLB = null; // store loaded gltf.scene for reuse
+let tripoTransformControls = null;
 
 function init() {
     if (!THREE) {
@@ -45,6 +50,8 @@ function init() {
     }
     
     try {
+        // Try to load environment variables from .env at startup (non-blocking)
+        ensureEnvLoaded();
         scene = new THREE.Scene();
         scene.background = new THREE.Color(0xf0f0f0);
     
@@ -285,20 +292,43 @@ function setupEventListeners() {
     
     document.getElementById('saveStructureBtn').addEventListener('click', saveSelectedStructure);
     
-    // Snap to default isometric view
-    const isoBtn = document.getElementById('isoViewBtn');
-    if (isoBtn) {
-        isoBtn.addEventListener('click', () => snapSceneCameraToDefaultIso());
+    // HUD transform controls
+    const hud = document.getElementById('transformHud');
+    const hudMove = document.getElementById('hudMove');
+    const hudRotate = document.getElementById('hudRotate');
+    const hudScale = document.getElementById('hudScale');
+    if (hudMove) hudMove.addEventListener('click', () => tripoTransformControls?.setMode('translate'));
+    if (hudRotate) hudRotate.addEventListener('click', () => tripoTransformControls?.setMode('rotate'));
+    if (hudScale) hudScale.addEventListener('click', () => tripoTransformControls?.setMode('scale'));
+    
+    // Make focus indicator clickable to exit focus mode
+    const focusIndicatorEl = document.getElementById('focusIndicator');
+    if (focusIndicatorEl) {
+        focusIndicatorEl.style.cursor = 'pointer';
+        focusIndicatorEl.title = 'Click to exit focus mode';
+        focusIndicatorEl.addEventListener('click', () => {
+            if (focusMode) toggleFocusMode();
+        });
     }
     
     window.addEventListener('resize', onWindowResize);
     
     // Keyboard events
     window.addEventListener('keydown', (event) => {
+        if (isTypingIntoInput(event)) return; // ignore hotkeys while typing
         if (event.key === 'Shift') {
             shiftPressed = true;
             if (selectedVoxels.length > 0) {
                 createGizmos();
+            }
+        } else if (tripoTransformControls) {
+            // W/E/R when transform controls are present
+            if (event.key === 'w' || event.key === 'W') {
+                tripoTransformControls.setMode('translate');
+            } else if (event.key === 'e' || event.key === 'E') {
+                tripoTransformControls.setMode('rotate');
+            } else if (event.key === 'r' || event.key === 'R') {
+                tripoTransformControls.setMode('scale');
             }
         } else if (event.key === ' ' || event.key === 'Spacebar') {
             event.preventDefault();
@@ -314,6 +344,7 @@ function setupEventListeners() {
     });
     
     window.addEventListener('keyup', (event) => {
+        if (isTypingIntoInput(event)) return;
         if (event.key === 'Shift') {
             shiftPressed = false;
             if (!isDraggingGizmo) {
@@ -774,6 +805,9 @@ function deleteSelectedVoxels() {
 function setupBuildifyEvents() {
     const closeBuildify = document.getElementById('closeBuildify');
     const captureBtn = document.getElementById('captureStructureBtn');
+    const sendFalDepthBtn = document.getElementById('sendFalDepthBtn');
+    const testLocalGlbBtn = document.getElementById('testLocalGlbBtn');
+    const uploadGlbInput = document.getElementById('uploadGlbInput');
 
     if (closeBuildify) {
         closeBuildify.addEventListener('click', () => {
@@ -785,6 +819,46 @@ function setupBuildifyEvents() {
     if (captureBtn) {
         captureBtn.addEventListener('click', async () => {
             await handleCaptureStructure();
+        });
+    }
+
+    if (sendFalDepthBtn) {
+        sendFalDepthBtn.addEventListener('click', async () => {
+            try {
+                await sendIsometricToFalDepth();
+            } catch (e) {
+                console.error('FLUX Depth call failed:', e);
+                alert('FLUX Depth call failed. See console for details.');
+            }
+        });
+    }
+
+    if (testLocalGlbBtn) {
+        testLocalGlbBtn.addEventListener('click', async () => {
+            const sample = await resolveSampleGlbUrl();
+            if (!sample) {
+                const gallery = document.getElementById('captureGallery');
+                const item = document.createElement('div');
+                item.className = 'capture-item';
+                item.innerHTML = `
+                    <div class="capture-header"><div class="capture-label">LOCAL GLB</div></div>
+                    <div class="tripo-viewer" style="height: 120px; display:flex; align-items:center; justify-content:center; color:#b00; font-size:12px; background:#f6f6f6; border:1px solid #e6e6e6; border-radius:4px;">
+                        Running from file:// cannot load sample GLB. Use Upload GLB or run a local server.
+                    </div>
+                `;
+                gallery && gallery.prepend(item);
+                return;
+            }
+            addLocalGlbCard(sample);
+        });
+    }
+
+    if (uploadGlbInput) {
+        uploadGlbInput.addEventListener('change', async (e) => {
+            const file = e.target.files && e.target.files[0];
+            if (!file) return;
+            const objectUrl = URL.createObjectURL(file);
+            addLocalGlbCard(objectUrl, () => URL.revokeObjectURL(objectUrl));
         });
     }
 }
@@ -805,31 +879,27 @@ async function handleCaptureStructure() {
 
         const { restore } = isolateForCapture(structureVoxels);
 
-        const width = 512;
-        const height = 512;
+        // Only produce the two assets we actually use: Iso color (for FLUX) and Iso depth (preview/reference)
+        const size = 768;
+        const camIso = createOrthoObliqueCameraToFit(bounds, size, size, DEFAULT_ISO_ELEVATION_DEG, DEFAULT_ISO_AZIMUTH_DEG);
+        expandOrthoFrustum(camIso, 1.06);
+        camIso.updateMatrixWorld(true);
 
-        // Top-down orthographic
-        const orthoTop = createOrthoCameraToFit(bounds, width, height, 'top');
-        const topDataUrl = renderToDataURL(orthoTop, width, height, { clearColor: 0xffffff });
+        const isoColorUrl = renderToDataURL(camIso, size, size, { clearColor: 0xffffff });
 
-        // Front orthographic
-        const orthoFront = createOrthoCameraToFit(bounds, width, height, 'front');
-        const frontDataUrl = renderToDataURL(orthoFront, width, height, { clearColor: 0xffffff });
-
-        // Ortho depth at the same default iso angles as the viewer
-        const orthoOblique = createOrthoObliqueCameraToFit(bounds, width, height, DEFAULT_ISO_ELEVATION_DEG, DEFAULT_ISO_AZIMUTH_DEG);
-        orthoOblique.updateMatrixWorld(true);
-        const { nearZ, farZ } = computeDepthRangeForSet(structureVoxels, orthoOblique);
+        const { nearZ, farZ } = computeDepthRangeForSet(structureVoxels, camIso);
         const depthMaterial = createLinearDepthMaterial(nearZ, farZ, true, 1.0, 32);
-        const depthDataUrl = renderToDataURL(orthoOblique, width, height, { overrideMaterial: depthMaterial, clearColor: 0x000000 });
+        const isoDepthUrl = renderToDataURL(camIso, size, size, { overrideMaterial: depthMaterial, clearColor: 0x000000 });
         depthMaterial.dispose();
 
         restore();
 
+        // Clear gallery and show only these two
+        const gallery = document.getElementById('captureGallery');
+        if (gallery) gallery.innerHTML = '';
         displayCapturedImages([
-            { label: 'Top-down', dataUrl: topDataUrl },
-            { label: 'Frontal', dataUrl: frontDataUrl },
-            { label: 'Iso Ortho Depth', dataUrl: depthDataUrl }
+            { label: 'ISOMETRIC COLOR', dataUrl: isoColorUrl },
+            { label: 'ISOMETRIC DEPTH', dataUrl: isoDepthUrl }
         ]);
     } catch (e) {
         console.error('Capture failed:', e);
@@ -844,10 +914,16 @@ function displayCapturedImages(images) {
     images.forEach(img => {
         const item = document.createElement('div');
         item.className = 'capture-item';
+        const filename = makeFilename(img.label);
         item.innerHTML = `
-            <div class="capture-label">${img.label}</div>
+            <div class="capture-header">
+                <div class="capture-label">${img.label}</div>
+                <button class="download-btn" data-filename="${filename}">Download</button>
+            </div>
             <img class="capture-img" src="${img.dataUrl}" alt="${img.label}">
         `;
+        const btn = item.querySelector('.download-btn');
+        btn.addEventListener('click', () => downloadDataURL(img.dataUrl, filename));
         gallery.appendChild(item);
     });
 }
@@ -1930,4 +2006,750 @@ function snapSceneCameraToDefaultIso() {
     camera.top = frustumSize / 2;
     camera.bottom = -frustumSize / 2;
     camera.updateProjectionMatrix();
+}
+
+// Compose side-by-side color and depth renders with labels
+async function renderSplitColorDepth(voxelSet, camera, width, height, leftLabel) {
+    const halfW = Math.floor(width / 2);
+
+    // Normal render (left)
+    const colorUrl = renderToDataURL(camera, halfW, height, { clearColor: 0xffffff });
+
+    // Depth render (right)
+    const { nearZ, farZ } = computeDepthRangeForSet(voxelSet, camera);
+    const depthMat = createLinearDepthMaterial(nearZ, farZ, true, 1.0, 32);
+    const depthUrl = renderToDataURL(camera, halfW, height, { overrideMaterial: depthMat, clearColor: 0x000000 });
+    depthMat.dispose();
+
+    const [colorImg, depthImg] = await Promise.all([
+        loadImageFromDataURL(colorUrl),
+        loadImageFromDataURL(depthUrl)
+    ]);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+
+    // Draw images
+    ctx.drawImage(colorImg, 0, 0, halfW, height);
+    ctx.drawImage(depthImg, halfW, 0, halfW, height);
+
+    // Overlay headers
+    const headerH = 28;
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+    ctx.fillRect(0, 0, halfW, headerH);
+    ctx.fillRect(halfW, 0, halfW, headerH);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 12px -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Oxygen, Ubuntu, sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(leftLabel.toUpperCase(), 10, Math.floor(headerH / 2));
+    ctx.fillText('DEPTH', halfW + 10, Math.floor(headerH / 2));
+
+    return canvas.toDataURL('image/png');
+}
+
+function loadImageFromDataURL(url) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = url;
+    });
+}
+
+function downloadDataURL(dataUrl, filename) {
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = filename || 'image.png';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+}
+
+function makeFilename(label) {
+    const base = String(label || 'image').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    const ts = new Date().toISOString().slice(0,19).replace(/[:T-]/g, '');
+    return `${base}_${ts}.png`;
+}
+
+function expandOrthoFrustum(cam, scale = 1.05) {
+    if (!(cam && 'left' in cam && 'right' in cam && 'top' in cam && 'bottom' in cam)) return;
+    const cx = (cam.left + cam.right) * 0.5;
+    const cy = (cam.top + cam.bottom) * 0.5;
+    const halfW = (cam.right - cam.left) * 0.5 * scale;
+    const halfH = (cam.top - cam.bottom) * 0.5 * scale;
+    cam.left = cx - halfW;
+    cam.right = cx + halfW;
+    cam.bottom = cy - halfH;
+    cam.top = cy + halfH;
+    cam.updateProjectionMatrix();
+}
+
+// Capture a fresh isometric color image, upload it to obtain a public URL, and call FLUX Depth API
+async function sendIsometricToFalDepth() {
+    await ensureEnvLoaded();
+    if (!focusedStructure) {
+        alert('Load a saved structure first.');
+        return;
+    }
+
+    const structureVoxels = collectVoxelsForStructure(focusedStructure);
+    if (structureVoxels.size === 0) {
+        alert('Could not find voxels for the active structure in the scene.');
+        return;
+    }
+
+    const bounds = computeBoundsForVoxelSet(structureVoxels);
+    const { restore } = isolateForCapture(structureVoxels);
+
+    const size = 768;
+    const cam = createOrthoObliqueCameraToFit(bounds, size, size, DEFAULT_ISO_ELEVATION_DEG, DEFAULT_ISO_AZIMUTH_DEG);
+    expandOrthoFrustum(cam, 1.06);
+    cam.updateMatrixWorld(true);
+    const colorUrl = renderToDataURL(cam, size, size, { clearColor: 0xffffff });
+
+    restore();
+
+    const apiKey = (window.FAL_KEY || localStorage.getItem('FAL_KEY'));
+    if (!apiKey) {
+        alert('Set your FAL_KEY first. Store it in localStorage under key "FAL_KEY" (localStorage.setItem("FAL_KEY", "YOUR_KEY")) and try again.');
+        return;
+    }
+
+    // Read prompt from UI
+    const promptInput = document.getElementById('falPromptInput');
+    const prompt = (promptInput && promptInput.value?.trim()) || 'High-quality render guided by isometric depth';
+
+    // Attempt 1: send data URL directly
+    const firstAttempt = await callFalDepth(apiKey, prompt, colorUrl);
+    if (firstAttempt) { attachFalResult(firstAttempt); return; }
+
+    // Attempt 2: fal storage
+    const uploadedUrl = await uploadViaFalClient(colorUrl);
+    if (uploadedUrl) {
+        const secondAttempt = await callFalDepth(apiKey, prompt, uploadedUrl);
+        if (secondAttempt) { attachFalResult(secondAttempt); return; }
+    }
+
+    // Attempt 3: Imgur
+    const imgurUrl = await uploadImageDataURL_viaImgurOnly(colorUrl);
+    if (imgurUrl) {
+        const thirdAttempt = await callFalDepth(apiKey, prompt, imgurUrl);
+        if (thirdAttempt) { attachFalResult(thirdAttempt); return; }
+    }
+
+    window.open(colorUrl, '_blank');
+    alert('Could not upload or send image automatically. The image was opened in a new tab; copy its data URL to a host and paste the URL into the API manually.');
+}
+
+async function callFalDepth(apiKey, prompt, controlImage) {
+    try {
+        const res = await fetch('https://fal.run/fal-ai/flux-pro/v1/depth', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Key ${apiKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                prompt,
+                control_image_url: controlImage,
+                image_size: 'landscape_4_3',
+                num_inference_steps: 28,
+                guidance_scale: 3.5,
+                num_images: 1,
+                output_format: 'jpeg',
+                safety_tolerance: '2'
+            })
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        const first = data && data.images && data.images[0] && data.images[0].url;
+        return first || null;
+    } catch (e) {
+        console.warn('fal depth call failed:', e);
+        return null;
+    }
+}
+
+function attachFalResult(imageUrl) {
+    const item = document.createElement('div');
+    item.className = 'capture-item';
+    item.innerHTML = `
+        <div class="capture-header">
+            <div class="capture-label">FLUX DEPTH RESULT</div>
+            <button class="download-btn">Download</button>
+        </div>
+        <img class="capture-img" src="${imageUrl}" alt="FLUX Depth Result">
+        <div class="capture-actions">
+            <button class="send-tripo-btn">SEND TO TRIPO</button>
+        </div>
+    `;
+    item.querySelector('.download-btn').addEventListener('click', async () => {
+        downloadDataURL(imageUrl, makeFilename('flux_depth_result'));
+    });
+    const sendBtn = item.querySelector('.send-tripo-btn');
+    sendBtn.addEventListener('click', async () => {
+        sendBtn.disabled = true;
+        sendBtn.textContent = 'Sending...';
+        try {
+            await sendImageToTripo(imageUrl);
+            sendBtn.textContent = 'Sent';
+        } catch (e) {
+            console.error('Tripo send failed:', e);
+            alert('Tripo send failed. See console for details.');
+            sendBtn.textContent = 'SEND TO TRIPO';
+            sendBtn.disabled = false;
+        }
+    });
+    const gallery = document.getElementById('captureGallery');
+    gallery && gallery.prepend(item);
+}
+
+async function uploadImageDataURL(dataUrl) {
+    try {
+        // Preferred: upload directly to fal storage using FAL_KEY (no external hosting key required)
+        const uploaded = await uploadViaFalClient(dataUrl);
+        if (uploaded) return uploaded;
+    } catch (e) {
+        console.warn('fal storage upload failed:', e);
+    }
+    try {
+        // Prefer Imgur anonymous upload if client ID provided
+        await ensureEnvLoaded();
+        const imgurClientId = window.IMGUR_CLIENT_ID || localStorage.getItem('IMGUR_CLIENT_ID');
+        if (imgurClientId) {
+            const base64 = dataUrl.split(',')[1];
+            const r = await fetch('https://api.imgur.com/3/image', {
+                method: 'POST',
+                headers: { Authorization: `Client-ID ${imgurClientId}` },
+                body: new URLSearchParams({ image: base64, type: 'base64' })
+            });
+            const j = await r.json();
+            if (j && j.data && j.data.link) return j.data.link;
+        }
+    } catch (e) {
+        console.warn('Imgur upload failed:', e);
+    }
+    return null;
+}
+
+// Imgur-only branch so caller can explicitly try it as a later fallback
+async function uploadImageDataURL_viaImgurOnly(dataUrl) {
+    try {
+        await ensureEnvLoaded();
+        const imgurClientId = window.IMGUR_CLIENT_ID || localStorage.getItem('IMGUR_CLIENT_ID');
+        if (!imgurClientId) return null;
+        const base64 = dataUrl.split(',')[1];
+        const r = await fetch('https://api.imgur.com/3/image', {
+            method: 'POST',
+            headers: { Authorization: `Client-ID ${imgurClientId}` },
+            body: new URLSearchParams({ image: base64, type: 'base64' })
+        });
+        const j = await r.json();
+        if (j && j.data && j.data.link) return j.data.link;
+    } catch (e) {
+        console.warn('Imgur upload failed:', e);
+    }
+    return null;
+}
+
+async function uploadViaFalClient(dataUrl) {
+    await ensureEnvLoaded();
+    const apiKey = window.FAL_KEY || localStorage.getItem('FAL_KEY');
+    if (!apiKey) return null;
+    const toBlob = await (await fetch(dataUrl)).blob();
+    try {
+        let fal;
+        try {
+            const mod = await import('https://esm.sh/@fal-ai/client');
+            fal = mod.fal || mod.default?.fal || mod;
+        } catch (_) {
+            const mod2 = await import('https://cdn.jsdelivr.net/npm/@fal-ai/client/+esm');
+            fal = mod2.fal || mod2.default?.fal || mod2;
+        }
+        if (fal?.config) {
+            try { fal.config({ credentials: apiKey }); } catch {}
+        }
+        if (fal?.storage?.upload) {
+            const url = await fal.storage.upload(toBlob);
+            return url || null;
+        }
+    } catch (e) {
+        console.warn('Failed to import/use @fal-ai/client:', e);
+    }
+    return null;
+}
+
+// Load environment variables from '/.env' and '/.env.local' if available
+async function ensureEnvLoaded() {
+    if (__envLoaded) return;
+    // 1) process.env (Electron/Node with nodeIntegration)
+    try {
+        // eslint-disable-next-line no-undef
+        if (typeof process !== 'undefined' && process?.env) {
+            applyEnvVars(process.env);
+        }
+    } catch {}
+    // 2) Try common paths
+    const candidates = [
+        '/.env', '/.env.local', './.env', './.env.local',
+        (() => { try { return new URL('.env', window.location.href).toString(); } catch { return null; } })(),
+        (() => { try { return new URL('.env.local', window.location.href).toString(); } catch { return null; } })()
+    ].filter(Boolean);
+    for (const p of candidates) {
+        try { await loadEnvFile(p); } catch {}
+    }
+    __envLoaded = true;
+    if (!window.FAL_KEY && !localStorage.getItem('FAL_KEY')) {
+        console.warn('[ENV] FAL_KEY not found after loading .env; set FAL_KEY in .env or localStorage.');
+    } else {
+        console.log('[ENV] FAL_KEY loaded.');
+    }
+}
+
+async function loadEnvFile(path) {
+    const res = await fetch(path, { cache: 'no-store' });
+    if (!res.ok) return;
+    const text = await res.text();
+    const vars = parseDotenv(text);
+    applyEnvVars(vars);
+}
+
+function parseDotenv(text) {
+    const out = {};
+    text.split(/\r?\n/).forEach(line => {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) return;
+        const eq = trimmed.indexOf('=');
+        if (eq === -1) return;
+        const key = trimmed.slice(0, eq).trim();
+        let val = trimmed.slice(eq + 1).trim();
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith('\'') && val.endsWith('\''))) {
+            val = val.slice(1, -1);
+        }
+        out[key] = val;
+    });
+    return out;
+}
+
+function applyEnvVars(vars) {
+    if (!vars) return;
+    if (vars.FAL_KEY) {
+        window.FAL_KEY = vars.FAL_KEY;
+        // Also persist for subsequent sessions
+        try { localStorage.setItem('FAL_KEY', vars.FAL_KEY); } catch {}
+    }
+    if (vars.IMGUR_CLIENT_ID) {
+        window.IMGUR_CLIENT_ID = vars.IMGUR_CLIENT_ID;
+        try { localStorage.setItem('IMGUR_CLIENT_ID', vars.IMGUR_CLIENT_ID); } catch {}
+    }
+}
+
+async function sendImageToTripo(imageUrl) {
+    await ensureEnvLoaded();
+    const apiKey = window.FAL_KEY || localStorage.getItem('FAL_KEY');
+    if (!apiKey) {
+        alert('FAL_KEY not set.');
+        return;
+    }
+    // Try direct REST first
+    let data = null;
+    try {
+        const res = await fetch('https://fal.run/tripo3d/tripo/v2.5/image-to-3d', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Key ${apiKey}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ image_url: imageUrl, texture: 'standard', texture_alignment: 'original_image', orientation: 'align_image' })
+        });
+        if (res.ok) {
+            data = await res.json();
+        }
+    } catch (e) {
+        console.warn('Direct Tripo call failed, will try client:', e);
+    }
+    // Fallback to client subscribe to wait if needed
+    if (!data || !data.model_mesh || !data.model_mesh.url) {
+        try {
+            let fal;
+            try {
+                const mod = await import('https://esm.sh/@fal-ai/client');
+                fal = mod.fal || mod.default?.fal || mod;
+            } catch (_) {
+                const mod2 = await import('https://cdn.jsdelivr.net/npm/@fal-ai/client/+esm');
+                fal = mod2.fal || mod2.default?.fal || mod2;
+            }
+            if (fal?.config) { try { fal.config({ credentials: apiKey }); } catch {} }
+            const result = await fal.subscribe('tripo3d/tripo/v2.5/image-to-3d', {
+                input: { image_url: imageUrl, texture: 'standard', texture_alignment: 'original_image', orientation: 'align_image' },
+                logs: true
+            });
+            data = result?.data || result;
+        } catch (e) {
+            console.error('Tripo client subscribe failed:', e);
+            throw e;
+        }
+    }
+
+    if (!data || !data.model_mesh || !data.model_mesh.url) {
+        throw new Error('Tripo response missing model mesh URL');
+    }
+    attachTripoResult(data.model_mesh.url, data.rendered_image && data.rendered_image.url);
+}
+
+function attachTripoResult(glbUrl, previewUrl) {
+    const gallery = document.getElementById('captureGallery');
+    const item = document.createElement('div');
+    item.className = 'capture-item';
+    const fileName = makeFilename('tripo_model');
+    item.innerHTML = `
+        <div class="capture-header">
+            <div class="capture-label">TRIPO 3D RESULT</div>
+            <button class="download-btn">Download GLB</button>
+        </div>
+        <div class="tripo-viewer" style="height: 320px; background: #f6f6f6; border: 1px solid #e6e6e6; border-radius: 4px;"></div>
+        <div class="capture-actions" style="margin-top: 8px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+            <label class="toggle-label" style="display:flex; align-items:center; gap:6px;">
+                <input type="checkbox" class="place-in-scene-toggle" /> Place in scene (replace structure)
+            </label>
+            <div class="tripo-tools" style="display:flex; gap:6px;">
+                <button class="buildify-btn" data-mode="translate">Move</button>
+                <button class="buildify-btn" data-mode="rotate">Rotate</button>
+                <button class="buildify-btn" data-mode="scale">Scale</button>
+            </div>
+        </div>
+    `;
+    item.querySelector('.download-btn').addEventListener('click', async () => {
+        const a = document.createElement('a');
+        a.href = glbUrl; a.download = fileName.replace(/\.png$/, '.glb');
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    });
+    gallery && gallery.prepend(item);
+    const container = item.querySelector('.tripo-viewer');
+    initTripoViewer(container, glbUrl);
+    const toggle = item.querySelector('.place-in-scene-toggle');
+    toggle.addEventListener('change', async (e) => {
+        if (e.target.checked) {
+            await enableTripoPlacement(glbUrl);
+        } else {
+            disableTripoPlacement();
+        }
+    });
+    const toolButtons = item.querySelectorAll('.tripo-tools .buildify-btn');
+    toolButtons.forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (!tripoTransformControls) return;
+            tripoTransformControls.setMode(btn.getAttribute('data-mode'));
+        });
+    });
+}
+
+async function initTripoViewer(container, glbUrl) {
+    const { GLTFLoader, DRACOLoader } = await getESMLoaders();
+    const OrbitControlsCtor = await getESMControls();
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xffffff);
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    const width = container.clientWidth || container.offsetWidth || (container.parentElement ? container.parentElement.clientWidth : 300) || 300;
+    const height = container.clientHeight || container.offsetHeight || 300;
+    renderer.setSize(width, height);
+    container.appendChild(renderer.domElement);
+    const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 5000);
+    camera.position.set(1.5, 1.5, 1.5);
+    const controls = new OrbitControlsCtor(camera, renderer.domElement);
+    controls.enableDamping = true;
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+    dir.position.set(5, 10, 7);
+    scene.add(dir);
+    const loader = new GLTFLoader();
+    const draco = new DRACOLoader();
+    draco.setDecoderPath('https://unpkg.com/three@' + (resolveThreeSemver() || '0.164.1') + '/examples/jsm/libs/draco/');
+    loader.setDRACOLoader(draco);
+    loader.setCrossOrigin('anonymous');
+    loader.load(glbUrl, (gltf) => {
+        const root = gltf.scene;
+        scene.add(root);
+        root.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+        const box = new THREE.Box3().setFromObject(root);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        root.position.sub(center);
+        const maxDim = Math.max(size.x, size.y, size.z);
+        const distance = maxDim / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2));
+        camera.position.set(distance, distance, distance);
+        camera.lookAt(0, 0, 0);
+        camera.updateProjectionMatrix();
+    }, (xhr) => {
+        const pct = xhr.total ? Math.round((xhr.loaded / xhr.total) * 100) : Math.round(xhr.loaded / 1000) + 'KB';
+        console.log('GLB loading progress:', pct);
+    }, (err) => {
+        console.error('GLB load error (viewer):', err);
+        const msg = document.createElement('div');
+        msg.style.cssText = 'padding:8px;color:#b00;font-size:12px;';
+        msg.textContent = 'Failed to load GLB. See console for details.';
+        container.appendChild(msg);
+    });
+    function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }
+    animate();
+    new ResizeObserver(() => {
+        const w = container.clientWidth || container.offsetWidth || 300; const h = container.clientHeight || container.offsetHeight || 300;
+        renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+    }).observe(container);
+}
+
+async function enableTripoPlacement(glbUrl) {
+    if (tripoPlacementEnabled) return;
+    const gltfRoot = await loadGLTFRoot(glbUrl);
+    cachedTripoGLB = gltfRoot;
+    // Compute placement bounds: prefer focused structure; else selected; else all voxels; else origin box
+    const bounds = computePlacementBounds();
+    // Inclusive voxel extents: add 1 unit to cover full voxel span along each axis
+    const inclusiveSize = new THREE.Vector3(
+        Math.max(1, Math.round(bounds.max.x - bounds.min.x + 1)),
+        Math.max(1, Math.round(bounds.max.y - bounds.min.y + 1)),
+        Math.max(1, Math.round(bounds.max.z - bounds.min.z + 1))
+    );
+    const targetCenter = new THREE.Vector3().addVectors(bounds.min, bounds.max).multiplyScalar(0.5);
+
+    // Compute model bbox at its native scale
+    const modelBox = new THREE.Box3().setFromObject(gltfRoot);
+    const modelSize = modelBox.getSize(new THREE.Vector3());
+    const modelCenter = modelBox.getCenter(new THREE.Vector3());
+
+    // Normalize to center pivot at (0,0,0)
+    gltfRoot.position.sub(modelCenter);
+
+    // Uniform scale to fit inside inclusive target size (slight margin)
+    const scale = Math.min(
+        inclusiveSize.x / Math.max(1e-6, modelSize.x),
+        inclusiveSize.y / Math.max(1e-6, modelSize.y),
+        inclusiveSize.z / Math.max(1e-6, modelSize.z)
+    ) * 0.98;
+    gltfRoot.scale.setScalar(scale);
+
+    // After scaling, re-center and move to target center
+    const scaledBox = new THREE.Box3().setFromObject(gltfRoot);
+    const scaledCenter = scaledBox.getCenter(new THREE.Vector3());
+    gltfRoot.position.sub(scaledCenter); // bring to local origin again
+    gltfRoot.position.add(targetCenter);
+
+    tripoModelGroup = new THREE.Group();
+    tripoModelGroup.userData.isTripoModel = true;
+    tripoModelGroup.add(gltfRoot);
+    scene.add(tripoModelGroup);
+    // Hide voxels if we are in focus mode; otherwise leave scene as-is
+    if (focusMode && focusedStructureVoxels.size > 0) hideOriginalFocusedStructure();
+    tripoPlacementEnabled = true;
+
+    // Attach transform controls gizmo
+    await attachTripoTransformControls(tripoModelGroup);
+}
+
+function disableTripoPlacement() {
+    if (!tripoPlacementEnabled) return;
+    if (tripoModelGroup) {
+        scene.remove(tripoModelGroup);
+        tripoModelGroup.traverse(obj => {
+            if (obj.isMesh) {
+                if (obj.geometry) obj.geometry.dispose();
+                if (obj.material) {
+                    if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
+                    else obj.material.dispose();
+                }
+            }
+        });
+        tripoModelGroup = null;
+    }
+    detachTripoTransformControls();
+    if (focusMode) restoreOriginalFocusedStructure();
+    tripoPlacementEnabled = false;
+}
+
+async function loadGLTFRoot(glbUrl) {
+    const { GLTFLoader, DRACOLoader } = await getESMLoaders();
+    const loader = new GLTFLoader();
+    const draco = new DRACOLoader();
+    draco.setDecoderPath('https://unpkg.com/three@' + (resolveThreeSemver() || '0.164.1') + '/examples/jsm/libs/draco/');
+    loader.setDRACOLoader(draco);
+    loader.setCrossOrigin('anonymous');
+    return new Promise((resolve, reject) => {
+        loader.load(glbUrl, (gltf) => resolve(gltf.scene), (xhr) => {
+            const pct = xhr.total ? Math.round((xhr.loaded / xhr.total) * 100) : Math.round(xhr.loaded / 1000) + 'KB';
+            console.log('GLB placement progress:', pct);
+        }, (err) => {
+            console.error('GLB load error (placement):', err);
+            reject(err);
+        });
+    });
+}
+
+function computePlacementBounds() {
+    if (focusMode && focusedStructureVoxels.size > 0) {
+        return computeFocusedStructureBounds();
+    }
+    if (selectedVoxels.length > 0) {
+        let min = new THREE.Vector3(Infinity, Infinity, Infinity);
+        let max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+        selectedVoxels.forEach(v => {
+            const p = v.position;
+            min.min(new THREE.Vector3(Math.round(p.x), Math.round(p.y), Math.round(p.z)));
+            max.max(new THREE.Vector3(Math.round(p.x), Math.round(p.y), Math.round(p.z)));
+        });
+        return { min, max };
+    }
+    if (voxels.length > 0) {
+        let min = new THREE.Vector3(Infinity, Infinity, Infinity);
+        let max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+        voxels.forEach(v => {
+            const p = v.position;
+            min.min(new THREE.Vector3(Math.round(p.x), Math.round(p.y), Math.round(p.z)));
+            max.max(new THREE.Vector3(Math.round(p.x), Math.round(p.y), Math.round(p.z)));
+        });
+        return { min, max };
+    }
+    // Fallback to origin 1x1x1 box
+    return { min: new THREE.Vector3(-0.5, 0, -0.5), max: new THREE.Vector3(0.5, 1, 0.5) };
+}
+
+function addLocalGlbCard(glbUrl, onCleanup) {
+    const gallery = document.getElementById('captureGallery');
+    const item = document.createElement('div');
+    item.className = 'capture-item';
+    item.innerHTML = `
+        <div class="capture-header">
+            <div class="capture-label">LOCAL GLB</div>
+            <a class="download-btn" href="${glbUrl}" download="example.glb">Download</a>
+        </div>
+        <div class="tripo-viewer" style="height: 320px; background: #f6f6f6; border: 1px solid #e6e6e6; border-radius: 4px;"></div>
+        <div class="capture-actions" style="margin-top: 8px; display: flex; align-items: center; gap: 12px;">
+            <label class="toggle-label" style="display:flex; align-items:center; gap:6px;">
+                <input type="checkbox" class="place-in-scene-toggle" /> Place in scene
+            </label>
+        </div>
+    `;
+    gallery && gallery.prepend(item);
+    const container = item.querySelector('.tripo-viewer');
+    initTripoViewer(container, glbUrl);
+    const toggle = item.querySelector('.place-in-scene-toggle');
+    toggle.addEventListener('change', async (e) => {
+        if (e.target.checked) {
+            try {
+                await enableTripoPlacement(glbUrl);
+            } catch (err) {
+                console.error('Placement failed:', err);
+                alert('Placement failed. See console for details.');
+                e.target.checked = false;
+            }
+        } else {
+            disableTripoPlacement();
+        }
+    });
+    if (onCleanup) {
+        item.addEventListener('remove', onCleanup, { once: true });
+    }
+}
+
+async function getESMLoaders() {
+    const rev = resolveThreeSemver() || '0.164.1';
+    const base = `https://esm.sh/three@${rev}`;
+    const loaders = await Promise.all([
+        import(`${base}/examples/jsm/loaders/GLTFLoader.js`),
+        import(`${base}/examples/jsm/loaders/DRACOLoader.js`)
+    ]);
+    const GLTFLoader = loaders[0].GLTFLoader || loaders[0].default?.GLTFLoader || loaders[0];
+    const DRACOLoader = loaders[1].DRACOLoader || loaders[1].default?.DRACOLoader || loaders[1];
+    return { GLTFLoader, DRACOLoader };
+}
+
+const __loadedScripts = new Set();
+function loadScriptOnce(key, src) {
+    if (__loadedScripts.has(key)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src; s.async = true; s.crossOrigin = 'anonymous';
+        s.onload = () => { __loadedScripts.add(key); resolve(); };
+        s.onerror = (e) => { console.error('Script load failed:', src, e); reject(e); };
+        document.head.appendChild(s);
+    });
+}
+
+async function getESMControls() {
+    const rev = resolveThreeSemver() || '0.164.1';
+    const base = `https://esm.sh/three@${rev}`;
+    const mod = await import(`${base}/examples/jsm/controls/OrbitControls.js`);
+    return mod.OrbitControls || mod.default?.OrbitControls || mod;
+}
+
+async function getESMTransformControls() {
+    const rev = resolveThreeSemver() || '0.164.1';
+    const base = `https://esm.sh/three@${rev}`;
+    const mod = await import(`${base}/examples/jsm/controls/TransformControls.js`);
+    return mod.TransformControls || mod.default?.TransformControls || mod;
+}
+
+async function attachTripoTransformControls(target) {
+    const TransformControlsCtor = await getESMTransformControls();
+    if (tripoTransformControls) {
+        tripoTransformControls.detach();
+        scene.remove(tripoTransformControls);
+        tripoTransformControls = null;
+    }
+    tripoTransformControls = new TransformControlsCtor(camera, renderer.domElement);
+    tripoTransformControls.setMode('translate');
+    tripoTransformControls.setSpace('world');
+    tripoTransformControls.addEventListener('dragging-changed', (e) => {
+        isDraggingGizmo = e.value;
+    });
+    // Enforce uniform scale when in scale mode
+    tripoTransformControls.addEventListener('objectChange', () => {
+        const mode = typeof tripoTransformControls.getMode === 'function' ? tripoTransformControls.getMode() : tripoTransformControls.mode;
+        if (mode === 'scale' && target) {
+            const s = target.scale;
+            const factor = Math.max(s.x, s.y, s.z);
+            target.scale.setScalar(factor);
+        }
+    });
+    tripoTransformControls.attach(target);
+    scene.add(tripoTransformControls);
+    // show HUD
+    const hud = document.getElementById('transformHud');
+    if (hud) hud.style.display = 'flex';
+}
+
+function detachTripoTransformControls() {
+    if (!tripoTransformControls) return;
+    tripoTransformControls.detach();
+    scene.remove(tripoTransformControls);
+    tripoTransformControls.dispose?.();
+    tripoTransformControls = null;
+    const hud = document.getElementById('transformHud');
+    if (hud) hud.style.display = 'none';
+}
+
+async function resolveSampleGlbUrl() {
+    if (location.protocol === 'file:') return null;
+    const base = location.origin;
+    const candidates = [`${base}/glbFiles/example1.glb`, './glbFiles/example1.glb', 'glbFiles/example1.glb'];
+    for (const u of candidates) {
+        try { const r = await fetch(u, { method: 'HEAD' }); if (r.ok) return u; } catch {}
+    }
+    return null;
+}
+
+function resolveThreeSemver() {
+    const rev = (THREE && THREE.REVISION) ? String(THREE.REVISION).trim() : '';
+    if (/^\d+$/.test(rev)) return `0.${rev}.0`;
+    return rev || '0.164.1';
+}
+
+function isTypingIntoInput(event) {
+    const el = event.target;
+    if (!el) return false;
+    if (el.isContentEditable) return true;
+    const tag = (el.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select';
 }

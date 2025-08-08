@@ -32,6 +32,11 @@
         </div>
         
         <div id="scene-container"></div>
+        <div id="transformHud" class="transform-hud" style="display:none;">
+            <button id="hudMove" class="hud-btn">Move</button>
+            <button id="hudRotate" class="hud-btn">Rotate</button>
+            <button id="hudScale" class="hud-btn">Scale</button>
+        </div>
         
         <div id="buildify-menu" class="buildify-menu" style="display: none;">
             <div class="buildify-header">
@@ -41,6 +46,18 @@
             <div class="buildify-content">
                 <div class="buildify-section">
                     <button id="captureStructureBtn" class="buildify-btn primary">Capture Structure</button>
+                </div>
+                <div class="buildify-section">
+                    <label for="falPromptInput">Prompt</label>
+                    <input id="falPromptInput" class="buildify-input" type="text" placeholder="Describe the image you want..." />
+                    <button id="sendFalDepthBtn" class="buildify-btn" style="margin-top: 8px;">Send to FLUX Depth</button>
+                </div>
+                <div class="buildify-section">
+                    <label>GLB testing</label>
+                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                        <button id="testLocalGlbBtn" class="buildify-btn">Load sample GLB</button>
+                        <label class="buildify-btn" for="uploadGlbInput" style="display:inline-flex; align-items:center; gap:8px; cursor:pointer;">Upload GLB<input id="uploadGlbInput" type="file" accept=".glb" style="display:none;" /></label>
+                    </div>
                 </div>
                 <div id="captureGallery" class="capture-gallery"></div>
             </div>
