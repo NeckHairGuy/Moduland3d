@@ -12,6 +12,7 @@
             <button id="selectBtn" class="tool-btn active">Select</button>
             <button id="saveStructureBtn" class="tool-btn">Save Structure</button>
             <button id="loadStructureBtn" class="tool-btn">Load Structure</button>
+            <button id="isoViewBtn" class="tool-btn">Iso View</button>
             <div class="separator"></div>
             <label>Grid X:</label>
             <input type="range" id="gridXSlider" min="5" max="50" value="20" class="grid-slider">
@@ -39,77 +40,9 @@
             </div>
             <div class="buildify-content">
                 <div class="buildify-section">
-                    <label>Model Description</label>
-                    <textarea id="modelDescription" placeholder="Describe what you want to create..." rows="4"></textarea>
+                    <button id="captureStructureBtn" class="buildify-btn primary">Capture Structure</button>
                 </div>
-                
-                <div class="buildify-section">
-                    <label>Detail Level</label>
-                    <input type="range" id="detailLevel" min="1" max="10" value="5" class="buildify-slider">
-                    <span id="detailValue">5</span>
-                </div>
-                
-                <div class="buildify-section">
-                    <label>Voxel Resolution</label>
-                    <select id="voxelResolution">
-                        <option value="low">Low (0.5x)</option>
-                        <option value="medium" selected>Medium (1x)</option>
-                        <option value="high">High (2x)</option>
-                        <option value="ultra">Ultra (4x)</option>
-                    </select>
-                </div>
-                
-                <div class="buildify-section">
-                    <label>Color Palette</label>
-                    <select id="colorPalette">
-                        <option value="auto">Auto-detect</option>
-                        <option value="vibrant">Vibrant</option>
-                        <option value="pastel">Pastel</option>
-                        <option value="monochrome">Monochrome</option>
-                        <option value="earth">Earth Tones</option>
-                    </select>
-                </div>
-                
-                <div class="buildify-section">
-                    <label>Style</label>
-                    <select id="buildStyle">
-                        <option value="realistic">Realistic</option>
-                        <option value="cartoon">Cartoon</option>
-                        <option value="minecraft">Minecraft-like</option>
-                        <option value="abstract">Abstract</option>
-                    </select>
-                </div>
-                
-                <div class="buildify-section">
-                    <label>Advanced Options</label>
-                    <div class="checkbox-group">
-                        <label class="checkbox-label">
-                            <input type="checkbox" id="preserveStructure" checked>
-                            <span>Preserve base structure</span>
-                        </label>
-                        <label class="checkbox-label">
-                            <input type="checkbox" id="smoothEdges">
-                            <span>Smooth edges</span>
-                        </label>
-                        <label class="checkbox-label">
-                            <input type="checkbox" id="addDetails" checked>
-                            <span>Add surface details</span>
-                        </label>
-                    </div>
-                </div>
-                
-                <div class="buildify-actions">
-                    <button id="generateModel" class="buildify-btn primary">Generate Model</button>
-                    <button id="previewModel" class="buildify-btn">Preview</button>
-                    <button id="resetModel" class="buildify-btn danger">Reset</button>
-                </div>
-                
-                <div id="buildifyProgress" class="buildify-progress" style="display: none;">
-                    <div class="progress-bar">
-                        <div class="progress-fill"></div>
-                    </div>
-                    <span class="progress-text">Generating...</span>
-                </div>
+                <div id="captureGallery" class="capture-gallery"></div>
             </div>
         </div>
         
