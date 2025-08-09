@@ -2598,15 +2598,27 @@ async function enableTripoPlacement(glbUrl, structureId = null) {
     cachedTripoGLB = gltfRoot;
     // Compute placement bounds: prefer focused structure; else selected; else all voxels; else origin box
     const bounds = structureId ? computeStructureBoundsById(structureId) : computePlacementBounds();
-    // Inclusive voxel extents: add 1 unit to cover full voxel span along each axis
-    const inclusiveSize = new THREE.Vector3(
-        Math.max(1, Math.round(bounds.max.x - bounds.min.x + 1)),
-        Math.max(1, Math.round(bounds.max.y - bounds.min.y + 1)),
-        Math.max(1, Math.round(bounds.max.z - bounds.min.z + 1))
+    
+    // The actual size of the structure in world units
+    // Since voxels are 1x1x1 and positioned at integer coordinates,
+    // the size is the difference between max and min bounds
+    const structureSize = new THREE.Vector3(
+        bounds.max.x - bounds.min.x,
+        bounds.max.y - bounds.min.y,
+        bounds.max.z - bounds.min.z
     );
+    
+    // The center of the structure bounds
     const targetCenter = new THREE.Vector3().addVectors(bounds.min, bounds.max).multiplyScalar(0.5);
+    
+    console.log('Placement Debug:', {
+        structureId,
+        bounds: { min: bounds.min.toArray(), max: bounds.max.toArray() },
+        structureSize: structureSize.toArray(),
+        targetCenter: targetCenter.toArray()
+    });
 
-    // Reset transforms before analysis and recenter pivot to model AABB center
+    // Reset transforms before analysis
     gltfRoot.rotation.set(0, 0, 0);
     gltfRoot.scale.set(1, 1, 1);
     gltfRoot.position.set(0, 0, 0);
@@ -2621,68 +2633,57 @@ async function enableTripoPlacement(glbUrl, structureId = null) {
     gltfRoot.position.sub(modelCenter);
     gltfRoot.updateMatrixWorld(true);
 
-    // Try PCA→PCA basis alignment against the structure
-    let placed = false;
-    try {
-        const pcaModel = computePCAAxesAndExtents(gltfRoot);
-        const pcaStruct = computeStructurePCA(structureId);
-        if (pcaModel && pcaStruct) {
-            const R = buildBestRotationFromBases(pcaModel.axes, pcaStruct.axes);
-            gltfRoot.setRotationFromMatrix(R);
-            gltfRoot.updateMatrixWorld(true);
-            // Compute current rotated size in world
-            const rotBox = new THREE.Box3().setFromObject(gltfRoot);
-            const rotSize = rotBox.getSize(new THREE.Vector3());
-            // Robust uniform scale (footprint-biased median of ratios)
-            const s = computeUniformScaleWeighted(inclusiveSize, rotSize);
-            gltfRoot.scale.setScalar(s);
-            gltfRoot.updateMatrixWorld(true);
-            placed = true;
-        }
-    } catch (e) {
-        console.warn('PCA→PCA alignment failed; will use fallback', e);
-    }
-
-    if (!placed) {
-        // Fallback: PCA→world mapping or axis-aligned search
-        try {
-            const pca = computePCAAxesAndExtents(gltfRoot);
-            const bestPCA = chooseBestMappingUsingPCA(pca.axes, pca.sizes, inclusiveSize);
-            if (bestPCA) {
-                gltfRoot.setRotationFromMatrix(bestPCA.matrix);
-                const rotBox = new THREE.Box3().setFromObject(gltfRoot);
-                const rotSize = rotBox.getSize(new THREE.Vector3());
-                const s = computeUniformScaleWeighted(inclusiveSize, rotSize);
-                gltfRoot.scale.setScalar(s);
-                gltfRoot.updateMatrixWorld(true);
-                placed = true;
-            }
-        } catch {}
-    }
-
-    if (!placed) {
-        const modelSize = new THREE.Box3().setFromObject(gltfRoot).getSize(new THREE.Vector3());
-        const best = chooseBestAxisAlignedRotation(modelSize, inclusiveSize);
-        gltfRoot.setRotationFromMatrix(best.matrix);
-        const rotBox = new THREE.Box3().setFromObject(gltfRoot);
-        const rotSize = rotBox.getSize(new THREE.Vector3());
-        const s = computeUniformScaleWeighted(inclusiveSize, rotSize);
-        gltfRoot.scale.setScalar(s);
+    // Check if we should rotate the model to better align with the structure
+    const modelBoxAtOrigin = new THREE.Box3().setFromObject(gltfRoot);
+    const modelSizeAtOrigin = modelBoxAtOrigin.getSize(new THREE.Vector3());
+    
+    // Find the longest axes for both model and structure
+    const modelMaxAxis = Math.max(modelSizeAtOrigin.x, modelSizeAtOrigin.y, modelSizeAtOrigin.z);
+    const structMaxAxis = Math.max(structureSize.x, structureSize.y, structureSize.z);
+    
+    // Simple 90-degree rotation check: if model's height is its longest dimension
+    // but structure is wider/deeper than tall, rotate the model
+    if (modelSizeAtOrigin.y === modelMaxAxis && structureSize.y !== structMaxAxis) {
+        // Rotate 90 degrees around X axis to lay the model down
+        gltfRoot.rotation.x = Math.PI / 2;
         gltfRoot.updateMatrixWorld(true);
+        // Recalculate bounding box after rotation
+        const rotatedBox = new THREE.Box3().setFromObject(gltfRoot);
+        modelSizeAtOrigin.copy(rotatedBox.getSize(new THREE.Vector3()));
     }
+    
+    // Calculate scale to fit the structure bounds
+    // Add 1 to each dimension to account for voxel size (voxels occupy full 1x1x1 space)
+    const scaleX = (structureSize.x + 1) / modelSizeAtOrigin.x;
+    const scaleY = (structureSize.y + 1) / modelSizeAtOrigin.y;
+    const scaleZ = (structureSize.z + 1) / modelSizeAtOrigin.z;
+    
+    // Use the minimum scale to ensure the model fits within bounds while maintaining proportions
+    const uniformScale = Math.min(scaleX, scaleY, scaleZ);
+    
+    gltfRoot.scale.setScalar(uniformScale);
+    gltfRoot.updateMatrixWorld(true);
 
-    // Align: bottom Y to structure min, XZ center to structure center (snapped)
-    const boxAfter = new THREE.Box3().setFromObject(gltfRoot);
-    const centerAfter = boxAfter.getCenter(new THREE.Vector3());
-    const yOffset = bounds.min.y - boxAfter.min.y;
-
-    gltfRoot.position.sub(centerAfter);
-    const snappedCenter = new THREE.Vector3(
-        Math.round(targetCenter.x),
-        0,
-        Math.round(targetCenter.z)
+    // Position the model so its center aligns with the target structure center
+    // The model is already centered at origin, so we just need to move it to the target
+    const finalPosition = new THREE.Vector3(
+        targetCenter.x,
+        targetCenter.y,
+        targetCenter.z
     );
-    gltfRoot.position.add(new THREE.Vector3(snappedCenter.x, yOffset, snappedCenter.z));
+    
+    gltfRoot.position.copy(finalPosition);
+    
+    console.log('Final Position Debug:', {
+        modelPosition: gltfRoot.position.toArray(),
+        targetCenter: targetCenter.toArray(),
+        boundsMin: bounds.min.toArray(),
+        boundsMax: bounds.max.toArray(),
+        uniformScale: uniformScale,
+        modelSizeAtOrigin: modelSizeAtOrigin.toArray(),
+        structureSize: structureSize.toArray(),
+        scales: { scaleX, scaleY, scaleZ }
+    });
 
     tripoModelGroup = new THREE.Group();
     tripoModelGroup.userData.isTripoModel = true;
