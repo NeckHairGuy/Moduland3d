@@ -52,6 +52,9 @@ let adjustingStructureId = null;
 let skinStates = new Map(); // id -> {x,y,scale}
 let lastPointer = null;
 let lastFalSeed = null;
+// Persistence
+const PERSIST_KEY = 'moduland_persist_state_v1';
+const PERSIST_ENABLED_KEY = 'moduland_persist_enabled';
 
 function init() {
     if (!THREE) {
@@ -113,6 +116,9 @@ function init() {
     
     setupControls();
     setupEventListeners();
+    ensurePersistToggle();
+    restorePersistentState();
+    window.addEventListener('beforeunload', () => { persistStateIfEnabled(); });
     
     animate();
     } catch (error) {
@@ -934,27 +940,37 @@ function displayCapturedImages(images) {
     if (!gallery) return;
     gallery.innerHTML = '';
     images.forEach(img => {
-        const item = document.createElement('div');
-        item.className = 'capture-item';
-        const filename = makeFilename(img.label);
-        item.innerHTML = `
-            <div class="capture-header">
-                <div class="capture-label">${img.label}</div>
-                <button class="download-btn" data-filename="${filename}">Download</button>
-            </div>
-            <img class="capture-img" src="${img.dataUrl}" alt="${img.label}">
-            <button class="capture-img-action stick-skin">Stick to structure</button>
-        `;
-        const btn = item.querySelector('.download-btn');
-        btn.addEventListener('click', () => downloadDataURL(img.dataUrl, filename));
-        // Stick to structure
-        item.querySelector('.stick-skin').addEventListener('click', async () => {
-            await addSkinToFocusedStructure(img.dataUrl);
-        });
-        gallery.appendChild(item);
+        appendGalleryImage(img.label, img.dataUrl, focusedStructure ? focusedStructure.id : undefined);
     });
     // Ensure bottom bar list is visible by updating menu
     updateStructuresMenu();
+    persistStateIfEnabled();
+}
+
+function appendGalleryImage(label, dataUrl, structureId) {
+    const gallery = document.getElementById('captureGallery');
+    if (!gallery) return;
+    const item = document.createElement('div');
+    item.className = 'capture-item';
+    item.dataset.type = 'image';
+    item.dataset.label = label || '';
+    item.dataset.src = dataUrl;
+    if (structureId != null) item.dataset.structureId = String(structureId);
+    const filename = makeFilename(label);
+    item.innerHTML = `
+        <div class="capture-header">
+            <div class="capture-label">${label}</div>
+            <button class="download-btn" data-filename="${filename}">Download</button>
+        </div>
+        <img class="capture-img" src="${dataUrl}" alt="${label}">
+        <button class="capture-img-action stick-skin">Stick to structure</button>
+    `;
+    const btn = item.querySelector('.download-btn');
+    btn.addEventListener('click', () => downloadDataURL(dataUrl, filename));
+    item.querySelector('.stick-skin').addEventListener('click', async () => {
+        await addSkinToFocusedStructure(dataUrl);
+    });
+    gallery.appendChild(item);
 }
 
 function collectVoxelsForStructure(structure) {
@@ -1862,7 +1878,10 @@ function updateStructuresMenu() {
         const hasSkins = (structureIdToSkinUrls.get(structure.id)?.length || 0) > 0;
         item.innerHTML = `
             <div class="structure-preview" style="position:relative;"></div>
-            <div class="structure-name">${structure.name}</div>
+            <div class="structure-name" style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                <span>${structure.name}</span>
+                <button class="structure-delete" title="Delete" style="font-size:12px; padding:2px 6px;">🗑</button>
+            </div>
             <div class="skin-controls">
                 <button class="skin-btn skin-left">◀</button>
                 <button class="skin-btn skin-adjust">🎯</button>
@@ -1874,13 +1893,16 @@ function updateStructuresMenu() {
         const left = item.querySelector('.skin-left');
         const right = item.querySelector('.skin-right');
         const adjust = item.querySelector('.skin-adjust');
-        left.addEventListener('click', (e) => { e.stopPropagation(); cycleSkin(structure.id, -1); });
-        right.addEventListener('click', (e) => { e.stopPropagation(); cycleSkin(structure.id, +1); });
+        left.addEventListener('click', (e) => { e.stopPropagation(); cycleSkin(structure.id, -1); persistStateIfEnabled(); });
+        right.addEventListener('click', (e) => { e.stopPropagation(); cycleSkin(structure.id, +1); persistStateIfEnabled(); });
         adjust.addEventListener('click', (e) => {
             e.stopPropagation(); toggleSkinAdjust(structure.id, adjust);
         });
+        const delBtn = item.querySelector('.structure-delete');
+        delBtn.addEventListener('click', (e) => { e.stopPropagation(); deleteStructureById(structure.id); });
         list.appendChild(item);
     });
+    persistStateIfEnabled();
 }
 
 function loadStructure(structure) {
@@ -2233,6 +2255,9 @@ async function callFalDepth(apiKey, prompt, controlImage, extraParams = {}) {
 function attachFalResult(imageUrl) {
     const item = document.createElement('div');
     item.className = 'capture-item';
+    item.dataset.type = 'flux';
+    item.dataset.src = imageUrl;
+    if (focusedStructure && focusedStructure.id != null) item.dataset.structureId = String(focusedStructure.id);
     item.innerHTML = `
         <div class="capture-header">
             <div class="capture-label">FLUX DEPTH RESULT</div>
@@ -2270,6 +2295,7 @@ function attachFalResult(imageUrl) {
     });
     const gallery = document.getElementById('captureGallery');
     gallery && gallery.prepend(item);
+    persistStateIfEnabled();
 }
 
 async function uploadImageDataURL(dataUrl) {
@@ -2470,6 +2496,9 @@ function attachTripoResult(glbUrl, previewUrl, sourceStructureId = null) {
     const gallery = document.getElementById('captureGallery');
     const item = document.createElement('div');
     item.className = 'capture-item';
+    item.dataset.type = 'tripo';
+    item.dataset.glb = glbUrl;
+    if (sourceStructureId != null) item.dataset.structureId = String(sourceStructureId);
     const fileName = makeFilename('tripo_model');
     item.innerHTML = `
         <div class="capture-header">
@@ -2506,6 +2535,7 @@ function attachTripoResult(glbUrl, previewUrl, sourceStructureId = null) {
             tripoTransformControls.setMode(btn.getAttribute('data-mode'));
         });
     });
+    persistStateIfEnabled();
 }
 
 async function initTripoViewer(container, glbUrl) {
@@ -2591,38 +2621,52 @@ async function enableTripoPlacement(glbUrl, structureId = null) {
     gltfRoot.position.sub(modelCenter);
     gltfRoot.updateMatrixWorld(true);
 
-    // Try PCA-based orientation matching first (robust to arbitrary model orientation)
+    // Try PCA→PCA basis alignment against the structure
     let placed = false;
     try {
-        const pca = computePCAAxesAndExtents(gltfRoot);
-        if (pca && pca.axes && pca.sizes) {
+        const pcaModel = computePCAAxesAndExtents(gltfRoot);
+        const pcaStruct = computeStructurePCA(structureId);
+        if (pcaModel && pcaStruct) {
+            const R = buildBestRotationFromBases(pcaModel.axes, pcaStruct.axes);
+            gltfRoot.setRotationFromMatrix(R);
+            gltfRoot.updateMatrixWorld(true);
+            // Compute current rotated size in world
+            const rotBox = new THREE.Box3().setFromObject(gltfRoot);
+            const rotSize = rotBox.getSize(new THREE.Vector3());
+            // Robust uniform scale (footprint-biased median of ratios)
+            const s = computeUniformScaleWeighted(inclusiveSize, rotSize);
+            gltfRoot.scale.setScalar(s);
+            gltfRoot.updateMatrixWorld(true);
+            placed = true;
+        }
+    } catch (e) {
+        console.warn('PCA→PCA alignment failed; will use fallback', e);
+    }
+
+    if (!placed) {
+        // Fallback: PCA→world mapping or axis-aligned search
+        try {
+            const pca = computePCAAxesAndExtents(gltfRoot);
             const bestPCA = chooseBestMappingUsingPCA(pca.axes, pca.sizes, inclusiveSize);
             if (bestPCA) {
                 gltfRoot.setRotationFromMatrix(bestPCA.matrix);
-                const s = Math.min(
-                    inclusiveSize.x / Math.max(1e-6, bestPCA.mappedSizes.x),
-                    inclusiveSize.y / Math.max(1e-6, bestPCA.mappedSizes.y),
-                    inclusiveSize.z / Math.max(1e-6, bestPCA.mappedSizes.z)
-                ) * 0.98;
+                const rotBox = new THREE.Box3().setFromObject(gltfRoot);
+                const rotSize = rotBox.getSize(new THREE.Vector3());
+                const s = computeUniformScaleWeighted(inclusiveSize, rotSize);
                 gltfRoot.scale.setScalar(s);
                 gltfRoot.updateMatrixWorld(true);
                 placed = true;
             }
-        }
-    } catch (e) {
-        console.warn('PCA orientation failed; will fall back to axis-aligned search', e);
+        } catch {}
     }
 
     if (!placed) {
-        // Fallback: axis-aligned rotation search with uniform scale
+        const modelSize = new THREE.Box3().setFromObject(gltfRoot).getSize(new THREE.Vector3());
         const best = chooseBestAxisAlignedRotation(modelSize, inclusiveSize);
         gltfRoot.setRotationFromMatrix(best.matrix);
-        const rotatedSize = best.rotatedSize;
-        const s = Math.min(
-            inclusiveSize.x / Math.max(1e-6, rotatedSize.x),
-            inclusiveSize.y / Math.max(1e-6, rotatedSize.y),
-            inclusiveSize.z / Math.max(1e-6, rotatedSize.z)
-        ) * 0.98;
+        const rotBox = new THREE.Box3().setFromObject(gltfRoot);
+        const rotSize = rotBox.getSize(new THREE.Vector3());
+        const s = computeUniformScaleWeighted(inclusiveSize, rotSize);
         gltfRoot.scale.setScalar(s);
         gltfRoot.updateMatrixWorld(true);
     }
@@ -2781,6 +2825,8 @@ function addLocalGlbCard(glbUrl, onCleanup) {
     const gallery = document.getElementById('captureGallery');
     const item = document.createElement('div');
     item.className = 'capture-item';
+    item.dataset.type = 'localglb';
+    item.dataset.glb = glbUrl;
     item.innerHTML = `
         <div class="capture-header">
             <div class="capture-label">LOCAL GLB</div>
@@ -2813,6 +2859,7 @@ function addLocalGlbCard(glbUrl, onCleanup) {
     if (onCleanup) {
         item.addEventListener('remove', onCleanup, { once: true });
     }
+    persistStateIfEnabled();
 }
 
 async function getESMLoaders() {
@@ -3447,6 +3494,7 @@ function chooseBestMappingUsingPCA(axes, sizes, targetSize) {
         [0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]
     ];
     let best = null;
+    const wX = 4, wZ = 4, wY = 1; // prioritize footprint alignment
     for (const p of perms) {
         for (const sx of [-1,1]) {
             for (const sy of [-1,1]) {
@@ -3454,27 +3502,318 @@ function chooseBestMappingUsingPCA(axes, sizes, targetSize) {
                 const ey = axes[p[1]].clone().multiplyScalar(sy).normalize();
                 let ez = new THREE.Vector3().crossVectors(ex, ey).normalize();
                 if (ez.lengthSq() < 0.9) continue; // skip degenerate
-                // Build rotation matrix columns (ex,ey,ez)
                 const m = new THREE.Matrix4().makeBasis(ex, ey, ez);
-                // Sizes mapped to world axes
                 const mappedSizes = new THREE.Vector3(sizes.getComponent(p[0]), sizes.getComponent(p[1]), sizes.getComponent(p[2]));
-                // Uniform scale residual
-                const s = Math.min(
-                    targetSize.x / Math.max(1e-6, mappedSizes.x),
-                    targetSize.y / Math.max(1e-6, mappedSizes.y),
-                    targetSize.z / Math.max(1e-6, mappedSizes.z)
-                );
-                const rx = s * mappedSizes.x - targetSize.x;
-                const ry = s * mappedSizes.y - targetSize.y;
-                const rz = s * mappedSizes.z - targetSize.z;
-                // Cost: dimension residual + mild penalty for tilting up away from +Y to keep gravity sense reasonable
+                // Weighted-LS optimal uniform scale
+                const mx = mappedSizes.x, my = mappedSizes.y, mz = mappedSizes.z;
+                const tx = targetSize.x, ty = targetSize.y, tz = targetSize.z;
+                const denom = wX*mx*mx + wY*my*my + wZ*mz*mz;
+                const s = denom > 1e-9 ? (wX*tx*mx + wY*ty*my + wZ*tz*mz) / denom : 1;
+                const rx = s*mx - tx;
+                const ry = s*my - ty;
+                const rz = s*mz - tz;
+                let cost = wX*rx*rx + wY*ry*ry + wZ*rz*rz;
+                // Keep gravity sense reasonable but do not force it
                 const upPenalty = Math.max(0, 1 - Math.max(0, ey.y));
-                const cost = rx*rx + ry*ry + rz*rz + upPenalty * 0.05 * (targetSize.x + targetSize.y + targetSize.z);
+                cost += upPenalty * 0.02 * (tx + ty + tz);
+                // Footprint tie-breaker: prefer same major-axis orientation in XZ as target
+                const tgtDiff = tx - tz;
+                const mapDiff = mx - mz;
+                cost += Math.abs(Math.sign(tgtDiff) - Math.sign(mapDiff)) * 0.01 * (tx + tz);
                 if (!best || cost < best.cost) {
-                    best = { cost, matrix: m, mappedSizes };
+                    best = { cost, matrix: m, mappedSizes, scale: s };
                 }
             }
         }
     }
     return best;
+}
+
+function chooseBestAxisAlignedRotation(modelSize, targetSize) {
+    const rotations = generateAxisAlignedRotations();
+    let best = { err: Infinity, matrix: new THREE.Matrix4(), rotatedSize: modelSize.clone(), scale: 1 };
+    const wX = 4, wZ = 4, wY = 1;
+    rotations.forEach(m => {
+        const axes = [
+            new THREE.Vector3().setFromMatrixColumn(m, 0),
+            new THREE.Vector3().setFromMatrixColumn(m, 1),
+            new THREE.Vector3().setFromMatrixColumn(m, 2)
+        ];
+        const abs = axes.map(a => new THREE.Vector3(Math.abs(a.x), Math.abs(a.y), Math.abs(a.z)));
+        const rotated = new THREE.Vector3(
+            modelSize.x * abs[0].x + modelSize.y * abs[0].y + modelSize.z * abs[0].z,
+            modelSize.x * abs[1].x + modelSize.y * abs[1].y + modelSize.z * abs[1].z,
+            modelSize.x * abs[2].x + modelSize.y * abs[2].y + modelSize.z * abs[2].z
+        );
+        const mx = rotated.x, my = rotated.y, mz = rotated.z;
+        const tx = targetSize.x, ty = targetSize.y, tz = targetSize.z;
+        const denom = wX*mx*mx + wY*my*my + wZ*mz*mz;
+        const s = denom > 1e-9 ? (wX*tx*mx + wY*ty*my + wZ*tz*mz) / denom : 1;
+        const rx = s*mx - tx;
+        const ry = s*my - ty;
+        const rz = s*mz - tz;
+        let err = wX*rx*rx + wY*ry*ry + wZ*rz*rz;
+        // footprint tie-breaker
+        const tgtDiff = tx - tz; const mapDiff = mx - mz;
+        err += Math.abs(Math.sign(tgtDiff) - Math.sign(mapDiff)) * 0.01 * (tx + tz);
+        if (err < best.err) {
+            best = { err, matrix: m, rotatedSize: rotated, scale: s };
+        }
+    });
+    return best;
+}
+
+function computeStructurePCA(structureId) {
+    // Gather points from the specified structure; fall back to focusedStructureVoxels
+    const pts = [];
+    const push = (x,y,z) => pts.push(new THREE.Vector3(x,y,z));
+    const s = savedStructures.find(ss => ss.id === structureId) || focusedStructure;
+    if (s && s.data && s.data.length) {
+        s.data.forEach(v => {
+            const p = Array.isArray(v.position) ? v.position : v.position?.toArray?.() || v.position;
+            if (!p) return; push(Math.round(p[0]), Math.round(p[1]), Math.round(p[2]));
+        });
+    } else if (focusedStructureVoxels.size > 0) {
+        focusedStructureVoxels.forEach(v => { const p = v.position; push(Math.round(p.x), Math.round(p.y), Math.round(p.z)); });
+    }
+    if (pts.length < 4) return null;
+    // Mean
+    const mean = new THREE.Vector3(); pts.forEach(p => mean.add(p)); mean.multiplyScalar(1/pts.length);
+    // Covariance
+    let c00=0,c01=0,c02=0,c11=0,c12=0,c22=0; for (const p of pts){const x=p.x-mean.x,y=p.y-mean.y,z=p.z-mean.z;c00+=x*x;c01+=x*y;c02+=x*z;c11+=y*y;c12+=y*z;c22+=z*z;} const invN=1/Math.max(1,pts.length-1); c00*=invN;c01*=invN;c02*=invN;c11*=invN;c12*=invN;c22*=invN;
+    const eig = jacobiEigenSymmetric3([c00,c01,c02,c01,c11,c12,c02,c12,c22]); if (!eig) return null;
+    const axes = [eig.vec0.clone().normalize(), eig.vec1.clone().normalize(), eig.vec2.clone().normalize()];
+    // Right-handed
+    const ez = new THREE.Vector3().crossVectors(axes[0], axes[1]).normalize(); if (ez.dot(axes[2]) < 0) axes[2].negate();
+    // Extents in this basis
+    let min0=Infinity,min1=Infinity,min2=Infinity,max0=-Infinity,max1=-Infinity,max2=-Infinity;
+    for (const p of pts){const d=new THREE.Vector3().subVectors(p,mean);const a0=d.dot(axes[0]);const a1=d.dot(axes[1]);const a2=d.dot(axes[2]);if(a0<min0)min0=a0;if(a0>max0)max0=a0;if(a1<min1)min1=a1;if(a1>max1)max1=a1;if(a2<min2)min2=a2;if(a2>max2)max2=a2;}
+    const sizes = new THREE.Vector3(max0-min0,max1-min1,max2-min2);
+    return { axes, sizes };
+}
+
+function buildBestRotationFromBases(srcAxes, dstAxes) {
+    // Return rotation matrix R mapping src basis to dst basis
+    const perms = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+    let best = { score: -Infinity, R: new THREE.Matrix4() };
+    for (const p of perms) {
+        for (const sx of [-1,1]) {
+            for (const sy of [-1,1]) {
+                const ex = srcAxes[p[0]].clone().multiplyScalar(sx).normalize();
+                const ey = srcAxes[p[1]].clone().multiplyScalar(sy).normalize();
+                const ez = new THREE.Vector3().crossVectors(ex, ey).normalize(); // right-handed
+                const S = new THREE.Matrix4().makeBasis(ex, ey, ez);
+                const D = new THREE.Matrix4().makeBasis(dstAxes[0], dstAxes[1], dstAxes[2]);
+                const St = new THREE.Matrix4().copy(S).transpose();
+                const R = new THREE.Matrix4().multiplyMatrices(D, St);
+                // Alignment score = sum of squared dot products of mapped axes
+                const score = Math.pow(dstAxes[0].dot(ex),2) + Math.pow(dstAxes[1].dot(ey),2) + Math.pow(dstAxes[2].dot(ez),2);
+                if (score > best.score) best = { score, R };
+            }
+        }
+    }
+    return best.R;
+}
+
+function computeUniformScaleWeighted(targetSize, currentSize) {
+    const rx = targetSize.x / Math.max(1e-6, currentSize.x);
+    const ry = targetSize.y / Math.max(1e-6, currentSize.y);
+    const rz = targetSize.z / Math.max(1e-6, currentSize.z);
+    const arr = [rx, rz, rx, rz, ry].sort((a,b)=>a-b); // footprint-biased median
+    return arr[Math.floor(arr.length/2)];
+}
+
+// --- Persistence helpers ---
+function ensurePersistToggle() {
+    try {
+        // Default ON if not set
+        if (localStorage.getItem(PERSIST_ENABLED_KEY) == null) {
+            localStorage.setItem(PERSIST_ENABLED_KEY, 'true');
+        }
+        const list = document.getElementById('structures-list');
+        if (!list || !list.parentElement) return;
+        let holder = document.getElementById('persistToggleHolder');
+        if (!holder) {
+            holder = document.createElement('div');
+            holder.id = 'persistToggleHolder';
+            holder.style.cssText = 'display:flex; align-items:center; gap:6px; margin:4px 0 6px 0; justify-content:flex-end;';
+            holder.innerHTML = `
+                <label style="font-size:12px; display:flex; align-items:center; gap:6px;">
+                    <span>Persistent</span>
+                    <input id="persistToggle" type="checkbox" />
+                </label>
+            `;
+            // Insert above the structures list
+            list.parentElement.insertBefore(holder, list);
+        }
+        const cb = document.getElementById('persistToggle');
+        cb.checked = (localStorage.getItem(PERSIST_ENABLED_KEY) !== 'false');
+        cb.addEventListener('change', () => {
+            localStorage.setItem(PERSIST_ENABLED_KEY, cb.checked ? 'true' : 'false');
+            if (cb.checked) persistStateIfEnabled();
+        });
+    } catch (e) { console.warn('persist toggle init failed', e); }
+}
+
+function isPersistenceEnabled() {
+    return localStorage.getItem(PERSIST_ENABLED_KEY) !== 'false';
+}
+
+function persistStateIfEnabled() {
+    if (!isPersistenceEnabled()) return;
+    try { const state = snapshotPersistentState(); localStorage.setItem(PERSIST_KEY, JSON.stringify(state)); } catch (e) { console.warn('persist failed', e); }
+}
+
+function snapshotPersistentState() {
+    // saved structures + skins + active indices + gallery items
+    const structures = savedStructures.map(s => ({ id: s.id, name: s.name, data: s.data, thumbnail: s.thumbnail }));
+    const skins = {};
+    structureIdToSkinUrls.forEach((arr, id) => { skins[id] = Array.from(arr); });
+    const skinIdx = {}; activeSkinIndex.forEach((idx, id) => { skinIdx[id] = idx; });
+    const gallery = snapshotGalleryState();
+    return { structures, skins, skinIdx, gallery };
+}
+
+function snapshotGalleryState() {
+    const gallery = document.getElementById('captureGallery');
+    if (!gallery) return [];
+    const out = [];
+    gallery.querySelectorAll('.capture-item').forEach(item => {
+        const type = item.dataset.type || 'image';
+        const label = (item.querySelector('.capture-label')?.textContent || '').trim();
+        const img = item.querySelector('img.capture-img');
+        const structureId = item.dataset.structureId ? Number(item.dataset.structureId) : undefined;
+        if (type === 'tripo' || type === 'localglb') {
+            out.push({ type: 'tripo', glb: item.dataset.glb || '', structureId });
+        } else if (img) {
+            out.push({ type: type === 'flux' ? 'flux' : 'image', src: img.src, label, structureId });
+        }
+    });
+    return out;
+}
+
+function restorePersistentState() {
+    if (!isPersistenceEnabled()) return;
+    try {
+        const raw = localStorage.getItem(PERSIST_KEY);
+        if (!raw) return;
+        const state = JSON.parse(raw);
+        // Restore structures
+        savedStructures = Array.isArray(state.structures) ? state.structures : [];
+        structureIdToSkinUrls = new Map();
+        if (state.skins) { Object.keys(state.skins).forEach(k => structureIdToSkinUrls.set(Number(k), state.skins[k])); }
+        activeSkinIndex = new Map();
+        if (state.skinIdx) { Object.keys(state.skinIdx).forEach(k => activeSkinIndex.set(Number(k), state.skinIdx[k])); }
+        // Rebuild scene voxels from saved structures
+        rebuildSceneFromSavedStructures();
+        updateStructuresMenu();
+        // Restore gallery
+        if (Array.isArray(state.gallery)) {
+            const gallery = document.getElementById('captureGallery');
+            if (gallery) gallery.innerHTML = '';
+            state.gallery.forEach(it => {
+                if (it.type === 'tripo' && it.glb) {
+                    // structureId may be missing from older saves; keep undefined
+                    attachTripoResult(it.glb, undefined, it.structureId ?? null);
+                } else if (it.type === 'flux' && it.src) {
+                    // tag with structure if recorded
+                    if (it.structureId != null) { const sId = String(it.structureId); }
+                    attachFalResult(it.src);
+                    const last = gallery.firstElementChild; if (last && it.structureId != null) last.dataset.structureId = String(it.structureId);
+                } else if (it.type === 'image' && it.src) {
+                    appendGalleryImage(it.label || 'IMAGE', it.src, it.structureId);
+                }
+            });
+        }
+    } catch (e) { console.warn('restore failed', e); }
+}
+
+function rebuildSceneFromSavedStructures() {
+    // Remove existing non-ground voxels
+    voxels.forEach(v => {
+        scene.remove(v);
+        if (v.userData && v.userData.edges) scene.remove(v.userData.edges);
+        v.geometry?.dispose?.();
+        v.material?.dispose?.();
+        if (v.userData?.edges) {
+            v.userData.edges.geometry?.dispose?.();
+            v.userData.edges.material?.dispose?.();
+        }
+    });
+    voxels = [];
+    // Recreate from saved structures
+    savedStructures.forEach(s => {
+        (s.data || []).forEach(vd => {
+            const p = Array.isArray(vd.position) ? vd.position : vd.position?.toArray?.() || vd.position;
+            if (!p) return;
+            createVoxelAtPosition(Math.round(p[0]), Math.round(p[1]), Math.round(p[2]), vd.color || 0xe0e0e0);
+        });
+    });
+}
+
+function createVoxelAtPosition(x, y, z, baseColor) {
+    const geometry = new THREE.BoxGeometry(voxelSize, voxelSize, voxelSize);
+    const material = new THREE.MeshPhongMaterial({ 
+        color: baseColor || 0xe0e0e0,
+        emissive: 0x000000,
+        emissiveIntensity: 0
+    });
+    const cube = new THREE.Mesh(geometry, material);
+    cube.position.set(x, y, z);
+    cube.userData = { type: 'voxel', selected: false, baseColor: baseColor || 0xe0e0e0 };
+    // Edges
+    const edges = new THREE.EdgesGeometry(geometry);
+    const edgeMaterial = new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 1 });
+    const edgeLines = new THREE.LineSegments(edges, edgeMaterial);
+    edgeLines.position.copy(cube.position);
+    cube.userData.edges = edgeLines;
+    scene.add(edgeLines);
+    updateVoxelColor(cube);
+    cube.castShadow = true; cube.receiveShadow = true;
+    scene.add(cube);
+    voxels.push(cube);
+}
+// --- end persistence ---
+
+function deleteStructureById(structureId) {
+    // Exit focus if needed
+    if (focusedStructure && focusedStructure.id === structureId) {
+        if (focusMode) exitFocusMode();
+        focusedStructure = null;
+        focusedStructureVoxels.clear();
+    }
+    // Remove voxels belonging to the structure
+    const s = savedStructures.find(ss => ss.id === structureId);
+    if (s && s.data) {
+        const posSet = new Set();
+        s.data.forEach(v => {
+            const p = Array.isArray(v.position) ? v.position : v.position?.toArray?.() || v.position;
+            if (!p) return; posSet.add(key(Math.round(p[0]), Math.round(p[1]), Math.round(p[2])));
+        });
+        const toRemove = [];
+        voxels.forEach(vx => { if (posSet.has(key(Math.round(vx.position.x), Math.round(vx.position.y), Math.round(vx.position.z)))) toRemove.push(vx); });
+        toRemove.forEach(vx => {
+            scene.remove(vx);
+            if (vx.userData?.edges) { scene.remove(vx.userData.edges); vx.userData.edges.geometry?.dispose?.(); vx.userData.edges.material?.dispose?.(); }
+            vx.geometry?.dispose?.(); vx.material?.dispose?.();
+            const idx = voxels.indexOf(vx); if (idx >= 0) voxels.splice(idx, 1);
+        });
+    }
+    // Remove skins and overlay
+    structureIdToSkinUrls.delete(structureId);
+    activeSkinIndex.delete(structureId);
+    const el = skinEls.get(structureId); if (el) { el.remove(); skinEls.delete(structureId); }
+    skinStates.delete(structureId);
+    // Remove gallery items with this structureId
+    const gallery = document.getElementById('captureGallery');
+    if (gallery) {
+        [...gallery.querySelectorAll('.capture-item')].forEach(it => {
+            if (Number(it.dataset.structureId) === structureId) it.remove();
+        });
+    }
+    // Remove from savedStructures
+    savedStructures = savedStructures.filter(ss => ss.id !== structureId);
+    updateStructuresMenu();
+    persistStateIfEnabled();
+    showToast('Structure deleted', 'success');
 }
