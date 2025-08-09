@@ -42,6 +42,13 @@ let tripoModelGroup = null;
 let tripoPlacementEnabled = false;
 let cachedTripoGLB = null; // store loaded gltf.scene for reuse
 let tripoTransformControls = null;
+let structureIdToSkins = new Map(); // id -> array of textures/skins
+let activeSkinIndex = new Map(); // id -> current index
+let skinOverlayMesh = null; // current skin overlay mesh in scene
+let skinOverlayEl = null; // current DOM overlay img element
+let skinAdjustActive = false;
+let skinAdjustState = { x: 0, y: 0, scale: 1 };
+let lastPointer = null;
 
 function init() {
     if (!THREE) {
@@ -291,6 +298,10 @@ function setupEventListeners() {
     });
     
     document.getElementById('saveStructureBtn').addEventListener('click', saveSelectedStructure);
+    const resetBtn = document.getElementById('resetCameraBtn');
+    if (resetBtn) {
+        resetBtn.addEventListener('click', () => snapSceneCameraToDefaultIso());
+    }
     
     // HUD transform controls
     const hud = document.getElementById('transformHud');
@@ -657,6 +668,9 @@ function enterFocusMode() {
     const buildifyMenu = document.getElementById('buildify-menu');
     buildifyMenu.style.display = 'flex';
     
+    // Raise ground plane/grid to top of base layer
+    setGroundElevation(true);
+    
     console.log('Entered focus mode for structure:', focusedStructure.name);
 }
 
@@ -701,6 +715,11 @@ function exitFocusMode() {
         toggleSelection(voxel);
     });
     
+    // Lower ground plane/grid back to base
+    setGroundElevation(false);
++    // Clear any skin overlay when exiting focus mode
++    clearSkinOverlay();
+
     console.log('Exited focus mode, updated structure with', focusedStructureVoxels.size, 'voxels');
 }
 
@@ -901,9 +920,10 @@ async function handleCaptureStructure() {
             { label: 'ISOMETRIC COLOR', dataUrl: isoColorUrl },
             { label: 'ISOMETRIC DEPTH', dataUrl: isoDepthUrl }
         ]);
+        showToast('Captured structure views', 'success');
     } catch (e) {
         console.error('Capture failed:', e);
-        alert('Capture failed. See console for details.');
+        showToast('Capture failed', 'error');
     }
 }
 
@@ -921,11 +941,18 @@ function displayCapturedImages(images) {
                 <button class="download-btn" data-filename="${filename}">Download</button>
             </div>
             <img class="capture-img" src="${img.dataUrl}" alt="${img.label}">
+            <button class="capture-img-action stick-skin">Stick to structure</button>
         `;
         const btn = item.querySelector('.download-btn');
         btn.addEventListener('click', () => downloadDataURL(img.dataUrl, filename));
+        // Stick to structure
+        item.querySelector('.stick-skin').addEventListener('click', async () => {
+            await addSkinToFocusedStructure(img.dataUrl);
+        });
         gallery.appendChild(item);
     });
+    // Ensure bottom bar list is visible by updating menu
+    updateStructuresMenu();
 }
 
 function collectVoxelsForStructure(structure) {
@@ -1830,12 +1857,26 @@ function updateStructuresMenu() {
     savedStructures.forEach(structure => {
         const item = document.createElement('div');
         item.className = 'structure-item';
+        const hasSkins = (structureIdToSkins.get(structure.id)?.length || 0) > 0;
         item.innerHTML = `
-            <div class="structure-preview"></div>
+            <div class="structure-preview" style="position:relative;"></div>
             <div class="structure-name">${structure.name}</div>
+            <div class="skin-controls">
+                <button class="skin-btn skin-left">◀</button>
+                <button class="skin-btn skin-adjust">🎯</button>
+                <button class="skin-btn skin-right">▶</button>
+            </div>
         `;
-        
         item.addEventListener('click', () => loadStructure(structure));
+        // Skin buttons
+        const left = item.querySelector('.skin-left');
+        const right = item.querySelector('.skin-right');
+        const adjust = item.querySelector('.skin-adjust');
+        left.addEventListener('click', (e) => { e.stopPropagation(); cycleSkin(structure.id, -1); });
+        right.addEventListener('click', (e) => { e.stopPropagation(); cycleSkin(structure.id, +1); });
+        adjust.addEventListener('click', (e) => {
+            e.stopPropagation(); toggleSkinAdjust(structure.id, adjust);
+        });
         list.appendChild(item);
     });
 }
@@ -1871,6 +1912,8 @@ function loadStructure(structure) {
     if (shiftPressed && selectedVoxels.length > 0) {
         createGizmos();
     }
+    // When loading a structure, apply its active skin if any
+    applyActiveSkinOverlay();
 }
 
 function onWindowResize() {
@@ -1885,11 +1928,14 @@ function onWindowResize() {
     camera.updateProjectionMatrix();
     
     renderer.setSize(container.clientWidth, container.clientHeight);
+    updateScreenOverlayTransform();
 }
 
 function animate() {
     requestAnimationFrame(animate);
     renderer.render(scene, camera);
+    updateScreenOverlayVisibility();
+    updateScreenOverlayTransform();
 }
 
 if (document.readyState === 'loading') {
@@ -1974,37 +2020,24 @@ function computeDepthRangeForSet(voxelSet, cameraForDepth) {
 }
 
 function snapSceneCameraToDefaultIso() {
-    // Fit the scene roughly to current grid extents vertically centered
-    const maxGridSize = Math.max(gridSizeX, gridSizeZ);
-    const bounds = {
-        min: new THREE.Vector3(-Math.floor(gridSizeX/2), 0, -Math.floor(gridSizeZ/2)),
-        max: new THREE.Vector3(Math.ceil(gridSizeX/2), Math.max(1, heightLimit), Math.ceil(gridSizeZ/2))
-    };
-
+    // Restore the exact initial camera state used at app load
     const container = document.getElementById('scene-container');
-    const width = container.clientWidth;
-    const height = container.clientHeight;
+    const width = container.clientWidth || renderer.domElement.width;
+    const height = container.clientHeight || renderer.domElement.height;
+    const aspect = width / height;
 
-    // Compute target position for orthographic camera to emulate iso
-    const center = new THREE.Vector3().addVectors(bounds.min, bounds.max).multiplyScalar(0.5);
-    const elev = THREE.MathUtils.degToRad(DEFAULT_ISO_ELEVATION_DEG);
-    const az = THREE.MathUtils.degToRad(DEFAULT_ISO_AZIMUTH_DEG);
-    const size = new THREE.Vector3().subVectors(bounds.max, bounds.min);
-    const radius = Math.max(1, size.length() * 0.5);
-    const distance = radius * 2.5;
-    const x = center.x + distance * Math.cos(elev) * Math.cos(az);
-    const y = center.y + distance * Math.sin(elev);
-    const z = center.z + distance * Math.cos(elev) * Math.sin(az);
-    camera.position.set(x, y, z);
-    camera.lookAt(center);
-
-    // Adjust orthographic frustum to match aspect
-    const aspect = (camera.right - camera.left) / (camera.top - camera.bottom) || (width / height);
-    const frustumSize = 30 / currentZoom;
-    camera.left = -frustumSize * aspect / 2;
-    camera.right = frustumSize * aspect / 2;
+    currentZoom = 1; // initial zoom
+    const frustumSize = 30; // initial frustum size
+    camera.left = (frustumSize * aspect) / -2;
+    camera.right = (frustumSize * aspect) / 2;
     camera.top = frustumSize / 2;
-    camera.bottom = -frustumSize / 2;
+    camera.bottom = frustumSize / -2;
+    camera.near = 0.1;
+    camera.far = 1000;
+
+    camera.position.set(20, 20, 20); // initial position
+    camera.up.set(0, 1, 0);
+    camera.lookAt(0, 0, 0);
     camera.updateProjectionMatrix();
 }
 
@@ -2091,7 +2124,8 @@ function expandOrthoFrustum(cam, scale = 1.05) {
 async function sendIsometricToFalDepth() {
     await ensureEnvLoaded();
     if (!focusedStructure) {
-        alert('Load a saved structure first.');
+        showToast('Load a saved structure first', 'error');
+        debugLog('send-flux:error:no-structure');
         return;
     }
 
@@ -2122,29 +2156,42 @@ async function sendIsometricToFalDepth() {
     const promptInput = document.getElementById('falPromptInput');
     const prompt = (promptInput && promptInput.value?.trim()) || 'High-quality render guided by isometric depth';
 
-    // Attempt 1: send data URL directly
-    const firstAttempt = await callFalDepth(apiKey, prompt, colorUrl);
-    if (firstAttempt) { attachFalResult(firstAttempt); return; }
+    // Read extra parameters from UI
+    const p = {
+        image_size: (document.getElementById('falSize')?.value) || 'landscape_4_3',
+        num_inference_steps: parseInt(document.getElementById('falSteps')?.value || '28', 10),
+        guidance_scale: parseFloat(document.getElementById('falGuidance')?.value || '3.5'),
+        seed: (document.getElementById('falSeed')?.value ? parseInt(document.getElementById('falSeed').value, 10) : undefined),
+        num_images: parseInt(document.getElementById('falNum')?.value || '1', 10),
+        output_format: (document.getElementById('falFormat')?.value) || 'jpeg',
+        safety_tolerance: (document.getElementById('falSafety')?.value) || '2',
+        sync_mode: !!(document.getElementById('falSync')?.checked)
+    };
 
-    // Attempt 2: fal storage
+    // Attempt 1: send data URL directly
+    const firstAttempt = await callFalDepth(apiKey, prompt, colorUrl, p);
+    if (firstAttempt) { debugLog('send-flux:direct:ok', { url: firstAttempt }); attachFalResult(firstAttempt); return; }
+    debugLog('send-flux:direct:miss');
     const uploadedUrl = await uploadViaFalClient(colorUrl);
     if (uploadedUrl) {
-        const secondAttempt = await callFalDepth(apiKey, prompt, uploadedUrl);
-        if (secondAttempt) { attachFalResult(secondAttempt); return; }
+        debugLog('send-flux:uploaded', { uploadedUrl });
+        const secondAttempt = await callFalDepth(apiKey, prompt, uploadedUrl, p);
+        if (secondAttempt) { debugLog('send-flux:upload:ok', { url: secondAttempt }); attachFalResult(secondAttempt); return; }
+        debugLog('send-flux:upload:miss');
     }
-
-    // Attempt 3: Imgur
     const imgurUrl = await uploadImageDataURL_viaImgurOnly(colorUrl);
     if (imgurUrl) {
-        const thirdAttempt = await callFalDepth(apiKey, prompt, imgurUrl);
-        if (thirdAttempt) { attachFalResult(thirdAttempt); return; }
+        debugLog('send-flux:imgur', { imgurUrl });
+        const thirdAttempt = await callFalDepth(apiKey, prompt, imgurUrl, p);
+        if (thirdAttempt) { debugLog('send-flux:imgur:ok', { url: thirdAttempt }); attachFalResult(thirdAttempt); return; }
+        debugLog('send-flux:imgur:miss');
     }
-
     window.open(colorUrl, '_blank');
-    alert('Could not upload or send image automatically. The image was opened in a new tab; copy its data URL to a host and paste the URL into the API manually.');
+    showToast('Could not auto-send image. Opened in new tab.', 'error');
+    debugLog('send-flux:fallback-open');
 }
 
-async function callFalDepth(apiKey, prompt, controlImage) {
+async function callFalDepth(apiKey, prompt, controlImage, extraParams = {}) {
     try {
         const res = await fetch('https://fal.run/fal-ai/flux-pro/v1/depth', {
             method: 'POST',
@@ -2155,12 +2202,14 @@ async function callFalDepth(apiKey, prompt, controlImage) {
             body: JSON.stringify({
                 prompt,
                 control_image_url: controlImage,
-                image_size: 'landscape_4_3',
-                num_inference_steps: 28,
-                guidance_scale: 3.5,
-                num_images: 1,
-                output_format: 'jpeg',
-                safety_tolerance: '2'
+                image_size: extraParams.image_size ?? 'landscape_4_3',
+                num_inference_steps: extraParams.num_inference_steps ?? 28,
+                guidance_scale: extraParams.guidance_scale ?? 3.5,
+                num_images: extraParams.num_images ?? 1,
+                output_format: extraParams.output_format ?? 'jpeg',
+                safety_tolerance: extraParams.safety_tolerance ?? '2',
+                seed: extraParams.seed,
+                sync_mode: extraParams.sync_mode ?? false
             })
         });
         if (!res.ok) return null;
@@ -2184,6 +2233,7 @@ function attachFalResult(imageUrl) {
         <img class="capture-img" src="${imageUrl}" alt="FLUX Depth Result">
         <div class="capture-actions">
             <button class="send-tripo-btn">SEND TO TRIPO</button>
+            <button class="capture-img-action stick-skin">Stick to structure</button>
         </div>
     `;
     item.querySelector('.download-btn').addEventListener('click', async () => {
@@ -2194,14 +2244,21 @@ function attachFalResult(imageUrl) {
         sendBtn.disabled = true;
         sendBtn.textContent = 'Sending...';
         try {
+            showToast('Sending to Tripo…', 'info');
             await sendImageToTripo(imageUrl);
             sendBtn.textContent = 'Sent';
+            showToast('Sent to Tripo', 'success');
         } catch (e) {
             console.error('Tripo send failed:', e);
-            alert('Tripo send failed. See console for details.');
+            showToast('Tripo send failed', 'error');
             sendBtn.textContent = 'SEND TO TRIPO';
             sendBtn.disabled = false;
         }
+    });
+    // Stick to structure (as skin)
+    item.querySelector('.stick-skin').addEventListener('click', async () => {
+        showToast('Preparing skin…', 'info');
+        await addSkinToFocusedStructure(imageUrl);
     });
     const gallery = document.getElementById('captureGallery');
     gallery && gallery.prepend(item);
@@ -2351,7 +2408,7 @@ async function sendImageToTripo(imageUrl) {
     await ensureEnvLoaded();
     const apiKey = window.FAL_KEY || localStorage.getItem('FAL_KEY');
     if (!apiKey) {
-        alert('FAL_KEY not set.');
+        showToast('FAL_KEY not set', 'error');
         return;
     }
     // Try direct REST first
@@ -2752,4 +2809,335 @@ function isTypingIntoInput(event) {
     if (el.isContentEditable) return true;
     const tag = (el.tagName || '').toLowerCase();
     return tag === 'input' || tag === 'textarea' || tag === 'select';
+}
+
+function setGroundElevation(raised) {
+    const y = raised ? voxelSize * 0.5 : 0;
+    scene.children.forEach(child => {
+        if (child.userData && (child.userData.isGridHelper || child.userData.isGridPlane)) {
+            child.position.y = y;
+            if (typeof child.updateMatrixWorld === 'function') child.updateMatrixWorld(true);
+        }
+    });
+}
+
+async function addSkinToFocusedStructure(imageUrl) {
+    if (!focusedStructure) {
+        showToast('Load a saved structure first', 'error');
+        debugLog('skin:error:no-structure');
+        return;
+    }
+    debugLog('skin:start', { imageUrl: imageUrl.slice(0, 64) });
+    const publicUrl = imageUrl.startsWith('data:') ? (await uploadViaFalClient(imageUrl)) || imageUrl : imageUrl;
+    if (publicUrl === imageUrl && imageUrl.startsWith('data:')) {
+        showToast('Could not upload image for background removal', 'error');
+        debugLog('skin:upload:miss');
+    } else {
+        debugLog('skin:upload:ok', { publicUrl: publicUrl.slice(0, 64) });
+    }
+    const processedUrl = await removeBackground(publicUrl) || publicUrl;
+    debugLog('skin:bg-removed', { processedUrl: processedUrl.slice(0, 64), usedRMBG: processedUrl !== publicUrl });
+    addScreenSpaceSkin(processedUrl);
+    showToast('Skin applied', 'success');
+}
+
+function applyActiveSkinOverlay() {
+    if (!focusedStructure) return;
+    // For 2D overlay approach, we simply re-render screen-space skin in addScreenSpaceSkin()
+}
+
+function clearSkinOverlay() {
+    const layer = document.getElementById('skinOverlayLayer');
+    if (!layer) return;
+    layer.innerHTML = '';
+    skinOverlayEl = null;
+}
+
+function cycleSkin(structureId, dir) {
+    // With screen-space skins, simply keep last one; cycling can be added if we retain multiple URLs
+}
+
+function computeBoundsForResetCamera() {
+    if (focusMode && focusedStructureVoxels.size > 0) {
+        return computeFocusedStructureBounds();
+    }
+    if (focusedStructure) {
+        return computeFocusedStructureBounds();
+    }
+    if (voxels.length > 0) {
+        let min = new THREE.Vector3(Infinity, Infinity, Infinity);
+        let max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+        voxels.forEach(v => {
+            const p = v.position;
+            min.min(new THREE.Vector3(Math.round(p.x), Math.round(p.y), Math.round(p.z)));
+            max.max(new THREE.Vector3(Math.round(p.x), Math.round(p.y), Math.round(p.z)));
+        });
+        return { min, max };
+    }
+    // fallback to grid extents
+    const min = new THREE.Vector3(-Math.floor(gridSizeX/2), 0, -Math.floor(gridSizeZ/2));
+    const max = new THREE.Vector3(Math.ceil(gridSizeX/2), Math.max(1, heightLimit), Math.ceil(gridSizeZ/2));
+    return { min, max };
+}
+
+async function removeBackground(imageUrl) {
+    try {
+        await ensureEnvLoaded();
+        const apiKey = window.FAL_KEY || localStorage.getItem('FAL_KEY');
+        if (!apiKey) return null;
+        const res = await fetch('https://fal.run/fal-ai/bria/background/remove', {
+            method: 'POST',
+            headers: { 'Authorization': `Key ${apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image_url: imageUrl, sync_mode: true })
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        return data?.image?.url || null;
+    } catch (e) {
+        console.warn('Background removal failed:', e);
+        return null;
+    }
+}
+
+function addScreenSpaceSkin(imageUrl) {
+    const layer = document.getElementById('skinOverlayLayer');
+    if (!layer) { debugLog('skin:layer:missing'); return; }
+    layer.innerHTML = '';
+    // Wrapper allows visible adjust frame and simpler transforms
+    const wrap = document.createElement('div');
+    wrap.style.position = 'absolute';
+    wrap.style.pointerEvents = skinAdjustActive ? 'auto' : 'none';
+    wrap.style.boxSizing = 'border-box';
+    wrap.style.border = skinAdjustActive ? '1px dashed #00e5ff' : 'none';
+    const img = document.createElement('img');
+    img.src = imageUrl;
+    img.onload = () => debugLog('skin:image:onload', { naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight });
+    img.onerror = (e) => debugLog('skin:image:onerror');
+    img.style.width = '100%';
+    img.style.height = '100%';
+    const rect = computeFocusedStructureScreenRect();
+    if (rect) {
+        wrap.style.left = `${rect.x}px`;
+        wrap.style.top = `${rect.y}px`;
+        wrap.style.width = `${rect.w}px`;
+        wrap.style.height = `${rect.h}px`;
+        wrap.style.transform = `translate(0,0) scale(${skinAdjustState.scale}) translate(${skinAdjustState.x}px, ${skinAdjustState.y}px)`;
+    } else {
+        wrap.style.left = '50%';
+        wrap.style.top = '50%';
+        wrap.style.transform = `translate(-50%, -50%) scale(${skinAdjustState.scale}) translate(${skinAdjustState.x}px, ${skinAdjustState.y}px)`;
+        debugLog('skin:rect:missing');
+    }
+    wrap.style.filter = 'drop-shadow(0 2px 6px rgba(0,0,0,0.25))';
+    wrap.appendChild(img);
+    layer.appendChild(wrap);
+    skinOverlayEl = wrap;
+    updateScreenOverlayVisibility();
+    updateScreenOverlayTransform();
+    updateSkinDebug();
+}
+
+function updateScreenOverlayVisibility() {
+    const layer = document.getElementById('skinOverlayLayer');
+    if (!layer) return;
+    const elev = THREE.MathUtils.degToRad(DEFAULT_ISO_ELEVATION_DEG);
+    const az = THREE.MathUtils.degToRad(DEFAULT_ISO_AZIMUTH_DEG);
+    // THREE cameras look down -Z; getWorldDirection returns forward (-Z in world). Our analytic dir must match that forward.
+    const defaultDir = new THREE.Vector3(Math.cos(elev) * Math.cos(az), Math.sin(elev), Math.cos(elev) * Math.sin(az)).normalize().negate();
+    const curDir = new THREE.Vector3();
+    camera.getWorldDirection(curDir);
+    const dot = curDir.normalize().dot(defaultDir);
+    layer.style.display = (dot > 0.995) ? 'block' : 'none';
+    debugLog('skin:visibility', { dot, display: layer.style.display, curDir: {x:curDir.x.toFixed(3),y:curDir.y.toFixed(3),z:curDir.z.toFixed(3)}, defaultDir: {x:defaultDir.x.toFixed(3),y:defaultDir.y.toFixed(3),z:defaultDir.z.toFixed(3)} });
+}
+
+function updateScreenOverlayTransform() {
+    if (!skinOverlayEl) return;
+    const rect = computeFocusedStructureScreenRect();
+    if (rect) {
+        skinOverlayEl.style.left = `${rect.x}px`;
+        skinOverlayEl.style.top = `${rect.y}px`;
+        skinOverlayEl.style.width = `${rect.w}px`;
+        skinOverlayEl.style.height = `${rect.h}px`;
+        skinOverlayEl.style.transform = `translate(0,0) scale(${skinAdjustState.scale}) translate(${skinAdjustState.x}px, ${skinAdjustState.y}px)`;
+    } else {
+        skinOverlayEl.style.transform = `translate(-50%, -50%) scale(${skinAdjustState.scale}) translate(${skinAdjustState.x}px, ${skinAdjustState.y}px)`;
+    }
+    updateSkinDebug();
+}
+
+function computeFocusedStructureScreenRect() {
+    if (!focusedStructure) return null;
+    const bounds = computeFocusedStructureBounds();
+    const corners = [];
+    for (let xi of [bounds.min.x, bounds.max.x]) {
+        for (let yi of [bounds.min.y, bounds.max.y]) {
+            for (let zi of [bounds.min.z, bounds.max.z]) {
+                corners.push(new THREE.Vector3(xi, yi, zi));
+            }
+        }
+    }
+    const container = document.getElementById('scene-container');
+    if (!container) return null;
+    const width = container.clientWidth;
+    const height = container.clientHeight;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    const proj = corners.map(p => p.clone().project(camera));
+    proj.forEach(v => {
+        const sx = (v.x * 0.5 + 0.5) * width;
+        const sy = (-v.y * 0.5 + 0.5) * height;
+        minX = Math.min(minX, sx); maxX = Math.max(maxX, sx);
+        minY = Math.min(minY, sy); maxY = Math.max(maxY, sy);
+    });
+    if (!isFinite(minX) || !isFinite(minY) || !isFinite(maxX) || !isFinite(maxX)) return null;
+    const margin = 8;
+    const rect = { x: Math.max(0, minX - margin), y: Math.max(0, minY - margin), w: Math.max(1, (maxX - minX) + margin * 2), h: Math.max(1, (maxY - minY) + margin * 2) };
+    debugLog('skin:rect', rect);
+    return rect;
+}
+
+function updateSkinDebug() {
+    const dbg = document.getElementById('skinDebug');
+    if (!dbg) return;
+    const layer = document.getElementById('skinOverlayLayer');
+    const rect = computeFocusedStructureScreenRect();
+    const elev = THREE.MathUtils.degToRad(DEFAULT_ISO_ELEVATION_DEG);
+    const az = THREE.MathUtils.degToRad(DEFAULT_ISO_AZIMUTH_DEG);
+    const defaultDir = new THREE.Vector3(Math.cos(elev) * Math.cos(az), Math.sin(elev), Math.cos(elev) * Math.sin(az)).normalize().negate();
+    const curDir = new THREE.Vector3();
+    camera.getWorldDirection(curDir);
+    const dot = curDir.normalize().dot(defaultDir);
+    dbg.style.display = 'block';
+    dbg.textContent = `overlay:${layer ? layer.style.display : 'n/a'} dot:${dot.toFixed(3)} rect:${rect ? `${rect.w}x${rect.h}` : 'none'} zoom:${currentZoom.toFixed(2)}`;
+}
+
+function debugLog(tag, payload) {
+    console.log(`[debug] ${tag}`, payload || '');
+}
+
+function toggleSkinAdjust(structureId, buttonEl) {
+    skinAdjustActive = !skinAdjustActive;
+    if (buttonEl) buttonEl.textContent = skinAdjustActive ? '✔' : '🎯';
+    if (skinOverlayEl) {
+        skinOverlayEl.style.pointerEvents = skinAdjustActive ? 'auto' : 'none';
+        skinOverlayEl.style.border = skinAdjustActive ? '1px dashed #00e5ff' : 'none';
+    }
+    const layer = document.getElementById('skinOverlayLayer');
+    if (!layer || !skinOverlayEl) return;
+    if (skinAdjustActive) {
+        showToast('Adjust skin: drag to move, use corner handles to scale, click ✔ when done.', 'info');
+        lastPointer = null;
+        layer.addEventListener('pointerdown', onSkinPointerDown);
+        window.addEventListener('pointermove', onSkinPointerMove, { passive: true });
+        window.addEventListener('pointerup', onSkinPointerUp);
+        layer.addEventListener('wheel', onSkinWheel, { passive: false });
+        renderSkinGizmoHandles();
+    } else {
+        showToast('Adjustment applied', 'success');
+        layer.removeEventListener('pointerdown', onSkinPointerDown);
+        window.removeEventListener('pointermove', onSkinPointerMove);
+        window.removeEventListener('pointerup', onSkinPointerUp);
+        layer.removeEventListener('wheel', onSkinWheel);
+        clearSkinGizmoHandles();
+    }
+}
+
+function onSkinPointerDown(e) {
+    if (!skinAdjustActive) return;
+    lastPointer = { x: e.clientX, y: e.clientY };
+    try { e.target.setPointerCapture?.(e.pointerId); } catch {}
+}
+
+function onSkinPointerMove(e) {
+    if (!skinAdjustActive || !lastPointer) return;
+    const dx = e.clientX - lastPointer.x;
+    const dy = e.clientY - lastPointer.y;
+    skinAdjustState.x += dx;
+    skinAdjustState.y += dy;
+    lastPointer = { x: e.clientX, y: e.clientY };
+    updateScreenOverlayTransform();
+}
+
+function onSkinPointerUp(e) {
+    lastPointer = null;
+}
+
+function onSkinWheel(e) {
+    if (!skinAdjustActive) return;
+    e.preventDefault();
+    const delta = e.deltaY;
+    const factor = Math.exp(-delta * 0.001);
+    skinAdjustState.scale = Math.max(0.1, Math.min(5, skinAdjustState.scale * factor));
+    updateScreenOverlayTransform();
+}
+
+function showToast(message, type = 'info', timeout = 3000) {
+    const cont = document.getElementById('toastContainer');
+    if (!cont) return;
+    const div = document.createElement('div');
+    div.className = `toast ${type}`;
+    div.textContent = message;
+    cont.appendChild(div);
+    setTimeout(() => {
+        div.remove();
+    }, timeout);
+}
+
+function renderSkinGizmoHandles() {
+    if (!skinOverlayEl) return;
+    clearSkinGizmoHandles();
+    const add = (left, top, cursor) => {
+        const h = document.createElement('div');
+        h.className = 'skin-gizmo-handle';
+        h.style.left = left;
+        h.style.top = top;
+        if (cursor) h.style.cursor = cursor;
+        h.addEventListener('pointerdown', onSkinHandleDown);
+        skinOverlayEl.appendChild(h);
+        return h;
+    };
+    // four corners
+    add('-6px', '-6px', 'nwse-resize');
+    add('calc(100% - 6px)', '-6px', 'nesw-resize');
+    add('-6px', 'calc(100% - 6px)', 'nesw-resize');
+    add('calc(100% - 6px)', 'calc(100% - 6px)', 'nwse-resize');
+    const centerDot = document.createElement('div');
+    centerDot.className = 'skin-gizmo-center';
+    centerDot.style.left = 'calc(50% - 4px)';
+    centerDot.style.top = 'calc(50% - 4px)';
+    skinOverlayEl.appendChild(centerDot);
+}
+
+function clearSkinGizmoHandles() {
+    if (!skinOverlayEl) return;
+    [...skinOverlayEl.querySelectorAll('.skin-gizmo-handle,.skin-gizmo-center')].forEach(n => n.remove());
+}
+
+let activeHandle = null;
+let handleStart = null;
+function onSkinHandleDown(e) {
+    if (!skinAdjustActive) return;
+    e.stopPropagation();
+    activeHandle = e.currentTarget;
+    handleStart = { x: e.clientX, y: e.clientY, scale: skinAdjustState.scale };
+    try { activeHandle.setPointerCapture?.(e.pointerId); } catch {}
+    window.addEventListener('pointermove', onSkinHandleMove, { passive: true });
+    window.addEventListener('pointerup', onSkinHandleUp);
+}
+
+function onSkinHandleMove(e) {
+    if (!activeHandle || !handleStart) return;
+    const dx = e.clientX - handleStart.x;
+    const dy = e.clientY - handleStart.y;
+    const delta = Math.max(Math.abs(dx), Math.abs(dy));
+    const factor = 1 + delta / 300 * (dx + dy >= 0 ? 1 : -1);
+    skinAdjustState.scale = Math.max(0.1, Math.min(5, handleStart.scale * factor));
+    updateScreenOverlayTransform();
+}
+
+function onSkinHandleUp(e) {
+    window.removeEventListener('pointermove', onSkinHandleMove);
+    window.removeEventListener('pointerup', onSkinHandleUp);
+    activeHandle = null;
+    handleStart = null;
 }

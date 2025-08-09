@@ -12,7 +12,7 @@
             <button id="selectBtn" class="tool-btn active">Select</button>
             <button id="saveStructureBtn" class="tool-btn">Save Structure</button>
             <button id="loadStructureBtn" class="tool-btn">Load Structure</button>
-            <button id="isoViewBtn" class="tool-btn">Iso View</button>
+            <button id="resetCameraBtn" class="tool-btn">Reset Camera</button>
             <div class="separator"></div>
             <label>Grid X:</label>
             <input type="range" id="gridXSlider" min="5" max="50" value="20" class="grid-slider">
@@ -31,7 +31,10 @@
             </div>
         </div>
         
-        <div id="scene-container"></div>
+        <div id="scene-container">
+            <div id="skinOverlayLayer" class="skin-overlay-layer"></div>
+            <div id="skinDebug" style="position:absolute; left:8px; top:8px; font-size:11px; color:#fff; background:rgba(0,0,0,0.4); padding:4px 6px; border-radius:4px; z-index:200; display:none;"></div>
+        </div>
         <div id="transformHud" class="transform-hud" style="display:none;">
             <button id="hudMove" class="hud-btn">Move</button>
             <button id="hudRotate" class="hud-btn">Rotate</button>
@@ -53,6 +56,59 @@
                     <button id="sendFalDepthBtn" class="buildify-btn" style="margin-top: 8px;">Send to FLUX Depth</button>
                 </div>
                 <div class="buildify-section">
+                    <label>FLUX parameters</label>
+                    <div style="display:flex; flex-wrap:wrap; gap:8px;">
+                        <div style="flex:1 1 45%;">
+                            <label>Image size</label>
+                            <select id="falSize" class="buildify-input">
+                                <option value="landscape_4_3" selected>landscape_4_3</option>
+                                <option value="landscape_16_9">landscape_16_9</option>
+                                <option value="portrait_4_3">portrait_4_3</option>
+                                <option value="portrait_16_9">portrait_16_9</option>
+                                <option value="square">square</option>
+                                <option value="square_hd">square_hd</option>
+                            </select>
+                        </div>
+                        <div style="flex:1 1 45%;">
+                            <label>Steps</label>
+                            <input id="falSteps" type="number" class="buildify-input" min="1" max="50" value="28" />
+                        </div>
+                        <div style="flex:1 1 45%;">
+                            <label>Guidance</label>
+                            <input id="falGuidance" type="number" class="buildify-input" step="0.1" min="1" max="20" value="3.5" />
+                        </div>
+                        <div style="flex:1 1 45%;">
+                            <label>Seed (optional)</label>
+                            <input id="falSeed" type="number" class="buildify-input" placeholder="random" />
+                        </div>
+                        <div style="flex:1 1 45%;">
+                            <label>Num images</label>
+                            <input id="falNum" type="number" class="buildify-input" min="1" max="4" value="1" />
+                        </div>
+                        <div style="flex:1 1 45%;">
+                            <label>Format</label>
+                            <select id="falFormat" class="buildify-input">
+                                <option value="jpeg" selected>jpeg</option>
+                                <option value="png">png</option>
+                            </select>
+                        </div>
+                        <div style="flex:1 1 45%;">
+                            <label>Safety tolerance</label>
+                            <select id="falSafety" class="buildify-input">
+                                <option value="1">1</option>
+                                <option value="2" selected>2</option>
+                                <option value="3">3</option>
+                                <option value="4">4</option>
+                                <option value="5">5</option>
+                                <option value="6">6</option>
+                            </select>
+                        </div>
+                        <label class="checkbox-label" style="margin-top:8px;">
+                            <input id="falSync" type="checkbox" /> Sync mode (wait for image)
+                        </label>
+                    </div>
+                </div>
+                <div class="buildify-section">
                     <label>GLB testing</label>
                     <div style="display:flex; gap:8px; flex-wrap:wrap;">
                         <button id="testLocalGlbBtn" class="buildify-btn">Load sample GLB</button>
@@ -70,5 +126,6 @@
     </div>
 
     <script src="renderer.js"></script>
+    <div id="toastContainer" class="toast-container"></div>
 </body>
 </html>
