@@ -42,13 +42,16 @@ let tripoModelGroup = null;
 let tripoPlacementEnabled = false;
 let cachedTripoGLB = null; // store loaded gltf.scene for reuse
 let tripoTransformControls = null;
-let structureIdToSkins = new Map(); // id -> array of textures/skins
+// Screen-space skins per structure
+let structureIdToSkinUrls = new Map(); // id -> array of skin image URLs
 let activeSkinIndex = new Map(); // id -> current index
 let skinOverlayMesh = null; // current skin overlay mesh in scene
-let skinOverlayEl = null; // current DOM overlay img element
+let skinEls = new Map(); // id -> wrapper div element
 let skinAdjustActive = false;
-let skinAdjustState = { x: 0, y: 0, scale: 1 };
+let adjustingStructureId = null;
+let skinStates = new Map(); // id -> {x,y,scale}
 let lastPointer = null;
+let lastFalSeed = null;
 
 function init() {
     if (!THREE) {
@@ -717,9 +720,8 @@ function exitFocusMode() {
     
     // Lower ground plane/grid back to base
     setGroundElevation(false);
-+    // Clear any skin overlay when exiting focus mode
-+    clearSkinOverlay();
-
+    // Keep any applied skin overlay visible outside focus mode
+ 
     console.log('Exited focus mode, updated structure with', focusedStructureVoxels.size, 'voxels');
 }
 
@@ -1857,7 +1859,7 @@ function updateStructuresMenu() {
     savedStructures.forEach(structure => {
         const item = document.createElement('div');
         item.className = 'structure-item';
-        const hasSkins = (structureIdToSkins.get(structure.id)?.length || 0) > 0;
+        const hasSkins = (structureIdToSkinUrls.get(structure.id)?.length || 0) > 0;
         item.innerHTML = `
             <div class="structure-preview" style="position:relative;"></div>
             <div class="structure-name">${structure.name}</div>
@@ -1913,7 +1915,7 @@ function loadStructure(structure) {
         createGizmos();
     }
     // When loading a structure, apply its active skin if any
-    applyActiveSkinOverlay();
+    applyActiveSkinForFocusedStructure();
 }
 
 function onWindowResize() {
@@ -2167,6 +2169,11 @@ async function sendIsometricToFalDepth() {
         safety_tolerance: (document.getElementById('falSafety')?.value) || '2',
         sync_mode: !!(document.getElementById('falSync')?.checked)
     };
+    // Seed lock: reuse last returned seed if checkbox present and enabled
+    const seedLockEl = document.getElementById('falSeedLock');
+    if (seedLockEl && seedLockEl.checked && lastFalSeed != null) {
+        p.seed = lastFalSeed;
+    }
 
     // Attempt 1: send data URL directly
     const firstAttempt = await callFalDepth(apiKey, prompt, colorUrl, p);
@@ -2214,6 +2221,7 @@ async function callFalDepth(apiKey, prompt, controlImage, extraParams = {}) {
         });
         if (!res.ok) return null;
         const data = await res.json();
+        try { if (typeof data?.seed === 'number') { lastFalSeed = data.seed; debugLog('send-flux:seed', { seed: lastFalSeed }); } } catch {}
         const first = data && data.images && data.images[0] && data.images[0].url;
         return first || null;
     } catch (e) {
@@ -2411,6 +2419,7 @@ async function sendImageToTripo(imageUrl) {
         showToast('FAL_KEY not set', 'error');
         return;
     }
+    const sourceStructureId = focusedStructure ? focusedStructure.id : null;
     // Try direct REST first
     let data = null;
     try {
@@ -2454,10 +2463,10 @@ async function sendImageToTripo(imageUrl) {
     if (!data || !data.model_mesh || !data.model_mesh.url) {
         throw new Error('Tripo response missing model mesh URL');
     }
-    attachTripoResult(data.model_mesh.url, data.rendered_image && data.rendered_image.url);
+    attachTripoResult(data.model_mesh.url, data.rendered_image && data.rendered_image.url, sourceStructureId);
 }
 
-function attachTripoResult(glbUrl, previewUrl) {
+function attachTripoResult(glbUrl, previewUrl, sourceStructureId = null) {
     const gallery = document.getElementById('captureGallery');
     const item = document.createElement('div');
     item.className = 'capture-item';
@@ -2468,15 +2477,10 @@ function attachTripoResult(glbUrl, previewUrl) {
             <button class="download-btn">Download GLB</button>
         </div>
         <div class="tripo-viewer" style="height: 320px; background: #f6f6f6; border: 1px solid #e6e6e6; border-radius: 4px;"></div>
-        <div class="capture-actions" style="margin-top: 8px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+        <div class="capture-actions" style="margin-top: 8px; display: flex; align-items: center; gap: 12px;">
             <label class="toggle-label" style="display:flex; align-items:center; gap:6px;">
                 <input type="checkbox" class="place-in-scene-toggle" /> Place in scene (replace structure)
             </label>
-            <div class="tripo-tools" style="display:flex; gap:6px;">
-                <button class="buildify-btn" data-mode="translate">Move</button>
-                <button class="buildify-btn" data-mode="rotate">Rotate</button>
-                <button class="buildify-btn" data-mode="scale">Scale</button>
-            </div>
         </div>
     `;
     item.querySelector('.download-btn').addEventListener('click', async () => {
@@ -2490,7 +2494,7 @@ function attachTripoResult(glbUrl, previewUrl) {
     const toggle = item.querySelector('.place-in-scene-toggle');
     toggle.addEventListener('change', async (e) => {
         if (e.target.checked) {
-            await enableTripoPlacement(glbUrl);
+            await enableTripoPlacement(glbUrl, sourceStructureId || (focusedStructure && focusedStructure.id));
         } else {
             disableTripoPlacement();
         }
@@ -2558,12 +2562,12 @@ async function initTripoViewer(container, glbUrl) {
     }).observe(container);
 }
 
-async function enableTripoPlacement(glbUrl) {
+async function enableTripoPlacement(glbUrl, structureId = null) {
     if (tripoPlacementEnabled) return;
     const gltfRoot = await loadGLTFRoot(glbUrl);
     cachedTripoGLB = gltfRoot;
     // Compute placement bounds: prefer focused structure; else selected; else all voxels; else origin box
-    const bounds = computePlacementBounds();
+    const bounds = structureId ? computeStructureBoundsById(structureId) : computePlacementBounds();
     // Inclusive voxel extents: add 1 unit to cover full voxel span along each axis
     const inclusiveSize = new THREE.Vector3(
         Math.max(1, Math.round(bounds.max.x - bounds.min.x + 1)),
@@ -2572,38 +2576,139 @@ async function enableTripoPlacement(glbUrl) {
     );
     const targetCenter = new THREE.Vector3().addVectors(bounds.min, bounds.max).multiplyScalar(0.5);
 
+    // Reset transforms before analysis and recenter pivot to model AABB center
+    gltfRoot.rotation.set(0, 0, 0);
+    gltfRoot.scale.set(1, 1, 1);
+    gltfRoot.position.set(0, 0, 0);
+    gltfRoot.updateMatrixWorld(true);
+
     // Compute model bbox at its native scale
     const modelBox = new THREE.Box3().setFromObject(gltfRoot);
     const modelSize = modelBox.getSize(new THREE.Vector3());
     const modelCenter = modelBox.getCenter(new THREE.Vector3());
 
-    // Normalize to center pivot at (0,0,0)
+    // Move pivot to origin for stable sizing
     gltfRoot.position.sub(modelCenter);
+    gltfRoot.updateMatrixWorld(true);
 
-    // Uniform scale to fit inside inclusive target size (slight margin)
-    const scale = Math.min(
-        inclusiveSize.x / Math.max(1e-6, modelSize.x),
-        inclusiveSize.y / Math.max(1e-6, modelSize.y),
-        inclusiveSize.z / Math.max(1e-6, modelSize.z)
-    ) * 0.98;
-    gltfRoot.scale.setScalar(scale);
+    // Try PCA-based orientation matching first (robust to arbitrary model orientation)
+    let placed = false;
+    try {
+        const pca = computePCAAxesAndExtents(gltfRoot);
+        if (pca && pca.axes && pca.sizes) {
+            const bestPCA = chooseBestMappingUsingPCA(pca.axes, pca.sizes, inclusiveSize);
+            if (bestPCA) {
+                gltfRoot.setRotationFromMatrix(bestPCA.matrix);
+                const s = Math.min(
+                    inclusiveSize.x / Math.max(1e-6, bestPCA.mappedSizes.x),
+                    inclusiveSize.y / Math.max(1e-6, bestPCA.mappedSizes.y),
+                    inclusiveSize.z / Math.max(1e-6, bestPCA.mappedSizes.z)
+                ) * 0.98;
+                gltfRoot.scale.setScalar(s);
+                gltfRoot.updateMatrixWorld(true);
+                placed = true;
+            }
+        }
+    } catch (e) {
+        console.warn('PCA orientation failed; will fall back to axis-aligned search', e);
+    }
 
-    // After scaling, re-center and move to target center
-    const scaledBox = new THREE.Box3().setFromObject(gltfRoot);
-    const scaledCenter = scaledBox.getCenter(new THREE.Vector3());
-    gltfRoot.position.sub(scaledCenter); // bring to local origin again
-    gltfRoot.position.add(targetCenter);
+    if (!placed) {
+        // Fallback: axis-aligned rotation search with uniform scale
+        const best = chooseBestAxisAlignedRotation(modelSize, inclusiveSize);
+        gltfRoot.setRotationFromMatrix(best.matrix);
+        const rotatedSize = best.rotatedSize;
+        const s = Math.min(
+            inclusiveSize.x / Math.max(1e-6, rotatedSize.x),
+            inclusiveSize.y / Math.max(1e-6, rotatedSize.y),
+            inclusiveSize.z / Math.max(1e-6, rotatedSize.z)
+        ) * 0.98;
+        gltfRoot.scale.setScalar(s);
+        gltfRoot.updateMatrixWorld(true);
+    }
+
+    // Align: bottom Y to structure min, XZ center to structure center (snapped)
+    const boxAfter = new THREE.Box3().setFromObject(gltfRoot);
+    const centerAfter = boxAfter.getCenter(new THREE.Vector3());
+    const yOffset = bounds.min.y - boxAfter.min.y;
+
+    gltfRoot.position.sub(centerAfter);
+    const snappedCenter = new THREE.Vector3(
+        Math.round(targetCenter.x),
+        0,
+        Math.round(targetCenter.z)
+    );
+    gltfRoot.position.add(new THREE.Vector3(snappedCenter.x, yOffset, snappedCenter.z));
 
     tripoModelGroup = new THREE.Group();
     tripoModelGroup.userData.isTripoModel = true;
     tripoModelGroup.add(gltfRoot);
     scene.add(tripoModelGroup);
-    // Hide voxels if we are in focus mode; otherwise leave scene as-is
     if (focusMode && focusedStructureVoxels.size > 0) hideOriginalFocusedStructure();
     tripoPlacementEnabled = true;
-
-    // Attach transform controls gizmo
     await attachTripoTransformControls(tripoModelGroup);
+}
+
+function chooseBestAxisAlignedRotation(modelSize, targetSize) {
+    const rotations = generateAxisAlignedRotations();
+    const longestAxisIndex = (modelSize.y >= modelSize.x && modelSize.y >= modelSize.z) ? 1 : (modelSize.x >= modelSize.z ? 0 : 2);
+    let best = { err: Infinity, matrix: new THREE.Matrix4(), rotatedSize: modelSize.clone() };
+    rotations.forEach(m => {
+        // rotated size under axis-aligned rotation = permutation of size
+        const axes = [
+            new THREE.Vector3().setFromMatrixColumn(m, 0),
+            new THREE.Vector3().setFromMatrixColumn(m, 1),
+            new THREE.Vector3().setFromMatrixColumn(m, 2)
+        ];
+        const abs = axes.map(a => new THREE.Vector3(Math.abs(a.x), Math.abs(a.y), Math.abs(a.z)));
+        const rotated = new THREE.Vector3(
+            modelSize.x * abs[0].x + modelSize.y * abs[0].y + modelSize.z * abs[0].z,
+            modelSize.x * abs[1].x + modelSize.y * abs[1].y + modelSize.z * abs[1].z,
+            modelSize.x * abs[2].x + modelSize.y * abs[2].y + modelSize.z * abs[2].z
+        );
+        const s = Math.min(
+            targetSize.x / Math.max(1e-6, rotated.x),
+            targetSize.y / Math.max(1e-6, rotated.y),
+            targetSize.z / Math.max(1e-6, rotated.z)
+        );
+        // residual error after uniform scaling
+        const rx = s * rotated.x - targetSize.x;
+        const ry = s * rotated.y - targetSize.y;
+        const rz = s * rotated.z - targetSize.z;
+        let err = rx * rx + ry * ry + rz * rz;
+        // Upright bias: encourage mapping the model's longest axis to +Y
+        const mapVec = axes[longestAxisIndex];
+        const yAlign = Math.max(0, mapVec.y); // prefer +Y
+        const bias = (1 - yAlign) * (targetSize.x + targetSize.y + targetSize.z);
+        err += bias * 0.01;
+        if (err < best.err) {
+            best = { err, matrix: m, rotatedSize: rotated };
+        }
+    });
+    return best;
+}
+
+function generateAxisAlignedRotations() {
+    const mats = [];
+    const bases = [
+        new THREE.Vector3(1, 0, 0), new THREE.Vector3(-1, 0, 0),
+        new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, -1, 0),
+        new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, -1)
+    ];
+    // choose world X from bases, world Y from bases not colinear, world Z = X x Y (right-handed)
+    for (const ex of bases) {
+        for (const ey of bases) {
+            if (Math.abs(ex.dot(ey)) > 0.001) continue; // must be orthogonal
+            const ez = new THREE.Vector3().crossVectors(ex, ey);
+            if (ez.lengthSq() < 0.9) continue; // reject degenerate
+            const m = new THREE.Matrix4().makeBasis(ex.clone(), ey.clone(), ez.clone());
+            // ensure determinant +1 (proper rotation)
+            const det = m.determinant();
+            if (det < 0.9) continue;
+            mats.push(m);
+        }
+    }
+    return mats;
 }
 
 function disableTripoPlacement() {
@@ -2837,24 +2942,53 @@ async function addSkinToFocusedStructure(imageUrl) {
     }
     const processedUrl = await removeBackground(publicUrl) || publicUrl;
     debugLog('skin:bg-removed', { processedUrl: processedUrl.slice(0, 64), usedRMBG: processedUrl !== publicUrl });
-    addScreenSpaceSkin(processedUrl);
+    // Save to structure
+    const id = focusedStructure.id;
+    if (!structureIdToSkinUrls.has(id)) structureIdToSkinUrls.set(id, []);
+    const arr = structureIdToSkinUrls.get(id);
+    arr.push(processedUrl);
+    activeSkinIndex.set(id, arr.length - 1);
+    applyActiveSkinForFocusedStructure();
+    updateStructuresMenu();
     showToast('Skin applied', 'success');
 }
 
-function applyActiveSkinOverlay() {
+function applyActiveSkinForFocusedStructure() {
     if (!focusedStructure) return;
-    // For 2D overlay approach, we simply re-render screen-space skin in addScreenSpaceSkin()
+    const id = focusedStructure.id;
+    const arr = structureIdToSkinUrls.get(id) || [];
+    const idx = activeSkinIndex.get(id) ?? -1; // -1 means none
+    if (idx < 0) {
+        clearSkinOverlay();
+        debugLog('skin:apply:none');
+        return;
+    }
+    const url = arr[idx];
+    if (!url) { clearSkinOverlay(); return; }
+    addScreenSpaceSkin(url);
 }
 
 function clearSkinOverlay() {
     const layer = document.getElementById('skinOverlayLayer');
     if (!layer) return;
     layer.innerHTML = '';
-    skinOverlayEl = null;
+    skinEls.forEach(el => el.remove());
+    skinEls.clear();
+    skinStates.clear();
 }
 
 function cycleSkin(structureId, dir) {
-    // With screen-space skins, simply keep last one; cycling can be added if we retain multiple URLs
+    const arr = structureIdToSkinUrls.get(structureId) || [];
+    const options = arr.length + 1; // include 'none' at ordinal 0
+    if (options <= 1) { clearSkinOverlay(); activeSkinIndex.set(structureId, -1); return; }
+    const current = activeSkinIndex.get(structureId) ?? -1; // -1 -> none
+    let ordinal = current + 1; // map -1..n-1 to 0..n
+    ordinal = (ordinal + dir + options) % options;
+    const nextIndex = ordinal - 1; // back to -1..n-1
+    activeSkinIndex.set(structureId, nextIndex);
+    if (focusedStructure && focusedStructure.id === structureId) {
+        applyActiveSkinForFocusedStructure();
+    }
 }
 
 function computeBoundsForResetCamera() {
@@ -2902,11 +3036,10 @@ async function removeBackground(imageUrl) {
 function addScreenSpaceSkin(imageUrl) {
     const layer = document.getElementById('skinOverlayLayer');
     if (!layer) { debugLog('skin:layer:missing'); return; }
-    layer.innerHTML = '';
     // Wrapper allows visible adjust frame and simpler transforms
     const wrap = document.createElement('div');
     wrap.style.position = 'absolute';
-    wrap.style.pointerEvents = skinAdjustActive ? 'auto' : 'none';
+    wrap.style.pointerEvents = 'none';
     wrap.style.boxSizing = 'border-box';
     wrap.style.border = skinAdjustActive ? '1px dashed #00e5ff' : 'none';
     const img = document.createElement('img');
@@ -2931,7 +3064,11 @@ function addScreenSpaceSkin(imageUrl) {
     wrap.style.filter = 'drop-shadow(0 2px 6px rgba(0,0,0,0.25))';
     wrap.appendChild(img);
     layer.appendChild(wrap);
-    skinOverlayEl = wrap;
+    // Store; caller will update position via updateScreenOverlayTransform
+    if (focusedStructure) {
+        skinEls.set(focusedStructure.id, wrap);
+        if (!skinStates.has(focusedStructure.id)) skinStates.set(focusedStructure.id, { x: 0, y: 0, scale: 1 });
+    }
     updateScreenOverlayVisibility();
     updateScreenOverlayTransform();
     updateSkinDebug();
@@ -2952,23 +3089,28 @@ function updateScreenOverlayVisibility() {
 }
 
 function updateScreenOverlayTransform() {
-    if (!skinOverlayEl) return;
-    const rect = computeFocusedStructureScreenRect();
-    if (rect) {
-        skinOverlayEl.style.left = `${rect.x}px`;
-        skinOverlayEl.style.top = `${rect.y}px`;
-        skinOverlayEl.style.width = `${rect.w}px`;
-        skinOverlayEl.style.height = `${rect.h}px`;
-        skinOverlayEl.style.transform = `translate(0,0) scale(${skinAdjustState.scale}) translate(${skinAdjustState.x}px, ${skinAdjustState.y}px)`;
-    } else {
-        skinOverlayEl.style.transform = `translate(-50%, -50%) scale(${skinAdjustState.scale}) translate(${skinAdjustState.x}px, ${skinAdjustState.y}px)`;
-    }
+    if (skinEls.size === 0) return;
+    skinEls.forEach((el, structureId) => {
+        const rect = computeStructureScreenRect(structureId);
+        const state = skinStates.get(structureId) || { x: 0, y: 0, scale: 1 };
+        if (rect) {
+            el.style.left = `${rect.x}px`;
+            el.style.top = `${rect.y}px`;
+            el.style.width = `${rect.w}px`;
+            el.style.height = `${rect.h}px`;
+            el.style.transform = `translate(0,0) scale(${state.scale}) translate(${state.x}px, ${state.y}px)`;
+        }
+    });
     updateSkinDebug();
 }
 
 function computeFocusedStructureScreenRect() {
     if (!focusedStructure) return null;
-    const bounds = computeFocusedStructureBounds();
+    return computeStructureScreenRect(focusedStructure.id);
+}
+
+function computeStructureScreenRect(structureId) {
+    const bounds = computeStructureBoundsById(structureId);
     const corners = [];
     for (let xi of [bounds.min.x, bounds.max.x]) {
         for (let yi of [bounds.min.y, bounds.max.y]) {
@@ -2996,11 +3138,28 @@ function computeFocusedStructureScreenRect() {
     return rect;
 }
 
+function computeStructureBoundsById(structureId) {
+    const s = savedStructures.find(ss => ss.id === structureId);
+    if (!s || !s.data || s.data.length === 0) return computeFocusedStructureBounds();
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    s.data.forEach(v => {
+        const p = Array.isArray(v.position) ? v.position : v.position?.toArray?.() || v.position;
+        if (!p) return;
+        const x = Math.round(p[0]);
+        const y = Math.round(p[1]);
+        const z = Math.round(p[2]);
+        minX = Math.min(minX, x); minY = Math.min(minY, y); minZ = Math.min(minZ, z);
+        maxX = Math.max(maxX, x); maxY = Math.max(maxY, y); maxZ = Math.max(maxZ, z);
+    });
+    return { min: new THREE.Vector3(minX, minY, minZ), max: new THREE.Vector3(maxX, maxY, maxZ) };
+}
+
 function updateSkinDebug() {
     const dbg = document.getElementById('skinDebug');
     if (!dbg) return;
     const layer = document.getElementById('skinOverlayLayer');
-    const rect = computeFocusedStructureScreenRect();
+    const rect = focusedStructure ? computeStructureScreenRect(focusedStructure.id) : null;
     const elev = THREE.MathUtils.degToRad(DEFAULT_ISO_ELEVATION_DEG);
     const az = THREE.MathUtils.degToRad(DEFAULT_ISO_AZIMUTH_DEG);
     const defaultDir = new THREE.Vector3(Math.cos(elev) * Math.cos(az), Math.sin(elev), Math.cos(elev) * Math.sin(az)).normalize().negate();
@@ -3008,7 +3167,7 @@ function updateSkinDebug() {
     camera.getWorldDirection(curDir);
     const dot = curDir.normalize().dot(defaultDir);
     dbg.style.display = 'block';
-    dbg.textContent = `overlay:${layer ? layer.style.display : 'n/a'} dot:${dot.toFixed(3)} rect:${rect ? `${rect.w}x${rect.h}` : 'none'} zoom:${currentZoom.toFixed(2)}`;
+    dbg.textContent = `overlay:${layer ? layer.style.display : 'n/a'} dot:${dot.toFixed(3)} rect:${rect ? `${rect.w}x${rect.h}` : 'none'} zoom:${currentZoom.toFixed(2)} skins:${skinEls.size}`;
 }
 
 function debugLog(tag, payload) {
@@ -3016,14 +3175,21 @@ function debugLog(tag, payload) {
 }
 
 function toggleSkinAdjust(structureId, buttonEl) {
+    // Only allow adjusting one structure at a time
+    if (skinAdjustActive && adjustingStructureId !== structureId) {
+        // Turn off previous
+        toggleSkinAdjust(adjustingStructureId, null);
+    }
     skinAdjustActive = !skinAdjustActive;
+    adjustingStructureId = skinAdjustActive ? structureId : null;
     if (buttonEl) buttonEl.textContent = skinAdjustActive ? '✔' : '🎯';
-    if (skinOverlayEl) {
-        skinOverlayEl.style.pointerEvents = skinAdjustActive ? 'auto' : 'none';
-        skinOverlayEl.style.border = skinAdjustActive ? '1px dashed #00e5ff' : 'none';
+    const el = skinEls.get(structureId);
+    if (el) {
+        el.style.pointerEvents = skinAdjustActive ? 'auto' : 'none';
+        el.style.border = skinAdjustActive ? '1px dashed #00e5ff' : 'none';
     }
     const layer = document.getElementById('skinOverlayLayer');
-    if (!layer || !skinOverlayEl) return;
+    if (!layer || !el) return;
     if (skinAdjustActive) {
         showToast('Adjust skin: drag to move, use corner handles to scale, click ✔ when done.', 'info');
         lastPointer = null;
@@ -3052,8 +3218,10 @@ function onSkinPointerMove(e) {
     if (!skinAdjustActive || !lastPointer) return;
     const dx = e.clientX - lastPointer.x;
     const dy = e.clientY - lastPointer.y;
-    skinAdjustState.x += dx;
-    skinAdjustState.y += dy;
+    const sid = adjustingStructureId;
+    if (!sid) return;
+    const st = skinStates.get(sid) || { x: 0, y: 0, scale: 1 };
+    st.x += dx; st.y += dy; skinStates.set(sid, st);
     lastPointer = { x: e.clientX, y: e.clientY };
     updateScreenOverlayTransform();
 }
@@ -3067,7 +3235,12 @@ function onSkinWheel(e) {
     e.preventDefault();
     const delta = e.deltaY;
     const factor = Math.exp(-delta * 0.001);
-    skinAdjustState.scale = Math.max(0.1, Math.min(5, skinAdjustState.scale * factor));
+    const sid = adjustingStructureId; if (!sid) return;
+    const st = skinStates.get(sid) || { x: 0, y: 0, scale: 1 };
+    const before = st.scale;
+    st.scale = Math.max(0.1, Math.min(5, before * factor));
+    skinStates.set(sid, st);
+    debugLog('skin:scale', { from: before.toFixed(3), to: st.scale.toFixed(3), delta: (st.scale - before).toFixed(3) });
     updateScreenOverlayTransform();
 }
 
@@ -3084,7 +3257,7 @@ function showToast(message, type = 'info', timeout = 3000) {
 }
 
 function renderSkinGizmoHandles() {
-    if (!skinOverlayEl) return;
+    if (!skinEls.size === 0) return;
     clearSkinGizmoHandles();
     const add = (left, top, cursor) => {
         const h = document.createElement('div');
@@ -3093,7 +3266,7 @@ function renderSkinGizmoHandles() {
         h.style.top = top;
         if (cursor) h.style.cursor = cursor;
         h.addEventListener('pointerdown', onSkinHandleDown);
-        skinOverlayEl.appendChild(h);
+        skinEls.get(structureId).appendChild(h);
         return h;
     };
     // four corners
@@ -3105,12 +3278,14 @@ function renderSkinGizmoHandles() {
     centerDot.className = 'skin-gizmo-center';
     centerDot.style.left = 'calc(50% - 4px)';
     centerDot.style.top = 'calc(50% - 4px)';
-    skinOverlayEl.appendChild(centerDot);
+    skinEls.get(structureId).appendChild(centerDot);
 }
 
 function clearSkinGizmoHandles() {
-    if (!skinOverlayEl) return;
-    [...skinOverlayEl.querySelectorAll('.skin-gizmo-handle,.skin-gizmo-center')].forEach(n => n.remove());
+    if (!skinEls.size === 0) return;
+    [...skinEls.values()].forEach(el => {
+        [...el.querySelectorAll('.skin-gizmo-handle,.skin-gizmo-center')].forEach(n => n.remove());
+    });
 }
 
 let activeHandle = null;
@@ -3131,7 +3306,12 @@ function onSkinHandleMove(e) {
     const dy = e.clientY - handleStart.y;
     const delta = Math.max(Math.abs(dx), Math.abs(dy));
     const factor = 1 + delta / 300 * (dx + dy >= 0 ? 1 : -1);
-    skinAdjustState.scale = Math.max(0.1, Math.min(5, handleStart.scale * factor));
+    const sid = adjustingStructureId; if (!sid) return;
+    const st = skinStates.get(sid) || { x: 0, y: 0, scale: 1 };
+    const before = st.scale;
+    st.scale = Math.max(0.1, Math.min(5, handleStart.scale * factor));
+    skinStates.set(sid, st);
+    debugLog('skin:scale', { from: before.toFixed(3), to: st.scale.toFixed(3), delta: (st.scale - before).toFixed(3) });
     updateScreenOverlayTransform();
 }
 
@@ -3140,4 +3320,161 @@ function onSkinHandleUp(e) {
     window.removeEventListener('pointerup', onSkinHandleUp);
     activeHandle = null;
     handleStart = null;
+}
+
+function computePCAAxesAndExtents(root) {
+    // Collect world-space vertices
+    const points = [];
+    root.updateMatrixWorld(true);
+    root.traverse(o => {
+        if (o.isMesh && o.geometry && o.geometry.attributes && o.geometry.attributes.position) {
+            const pos = o.geometry.attributes.position;
+            const m = o.matrixWorld;
+            const v = new THREE.Vector3();
+            for (let i = 0; i < pos.count; i++) {
+                v.set(pos.getX(i), pos.getY(i), pos.getZ(i)).applyMatrix4(m);
+                points.push(v.clone());
+            }
+        }
+    });
+    if (points.length < 4) return null;
+    // Mean
+    const mean = new THREE.Vector3();
+    for (const p of points) mean.add(p);
+    mean.multiplyScalar(1 / points.length);
+    // Covariance (symmetric)
+    let c00 = 0, c01 = 0, c02 = 0, c11 = 0, c12 = 0, c22 = 0;
+    for (const p of points) {
+        const x = p.x - mean.x, y = p.y - mean.y, z = p.z - mean.z;
+        c00 += x * x; c01 += x * y; c02 += x * z;
+        c11 += y * y; c12 += y * z; c22 += z * z;
+    }
+    const invN = 1 / Math.max(1, points.length - 1);
+    c00 *= invN; c01 *= invN; c02 *= invN; c11 *= invN; c12 *= invN; c22 *= invN;
+    const cov = [c00, c01, c02, c01, c11, c12, c02, c12, c22];
+    const eig = jacobiEigenSymmetric3(cov);
+    if (!eig) return null;
+    // Eigenvectors as columns, largest first
+    const axes = [eig.vec0.clone().normalize(), eig.vec1.clone().normalize(), eig.vec2.clone().normalize()];
+    // Ensure right-handed basis
+    const ez = new THREE.Vector3().crossVectors(axes[0], axes[1]).normalize();
+    if (ez.dot(axes[2]) < 0) axes[2].negate();
+    // Extents along PCA axes
+    let min0 = Infinity, min1 = Infinity, min2 = Infinity;
+    let max0 = -Infinity, max1 = -Infinity, max2 = -Infinity;
+    for (const p of points) {
+        const d = new THREE.Vector3().subVectors(p, mean);
+        const a0 = d.dot(axes[0]);
+        const a1 = d.dot(axes[1]);
+        const a2 = d.dot(axes[2]);
+        if (a0 < min0) min0 = a0; if (a0 > max0) max0 = a0;
+        if (a1 < min1) min1 = a1; if (a1 > max1) max1 = a1;
+        if (a2 < min2) min2 = a2; if (a2 > max2) max2 = a2;
+    }
+    const sizes = new THREE.Vector3(max0 - min0, max1 - min1, max2 - min2);
+    return { axes, sizes };
+}
+
+function jacobiEigenSymmetric3(m) {
+    // m is length-9 array [m00,m01,m02,m10,m11,m12,m20,m21,m22] with m10=m01, etc.
+    // Initialize V as identity
+    let v00 = 1, v01 = 0, v02 = 0,
+        v10 = 0, v11 = 1, v12 = 0,
+        v20 = 0, v21 = 0, v22 = 1;
+    let a00 = m[0], a01 = m[1], a02 = m[2], a11 = m[4], a12 = m[5], a22 = m[8];
+    const maxIter = 32;
+    for (let iter = 0; iter < maxIter; iter++) {
+        // Find largest off-diagonal
+        let p = 0, q = 1; let apq = Math.abs(a01);
+        if (Math.abs(a02) > apq) { p = 0; q = 2; apq = Math.abs(a02); }
+        if (Math.abs(a12) > apq) { p = 1; q = 2; apq = Math.abs(a12); }
+        if (apq < 1e-10) break;
+        // Compute rotation
+        let app, aqq, apqVal;
+        if (p === 0 && q === 1) { app = a00; aqq = a11; apqVal = a01; }
+        else if (p === 0 && q === 2) { app = a00; aqq = a22; apqVal = a02; }
+        else { app = a11; aqq = a22; apqVal = a12; }
+        const phi = 0.5 * Math.atan2(2 * apqVal, (aqq - app));
+        const c = Math.cos(phi), s = Math.sin(phi);
+        // Apply rotation to A (symmetric update)
+        if (p === 0 && q === 1) {
+            const a00n = c * c * a00 - 2 * s * c * a01 + s * s * a11;
+            const a11n = s * s * a00 + 2 * s * c * a01 + c * c * a11;
+            const a01n = 0;
+            const a02n = c * a02 - s * a12;
+            const a12n = s * a02 + c * a12;
+            a00 = a00n; a11 = a11n; a01 = a01n; a02 = a02n; a12 = a12n;
+            // Update V columns 0 and 1
+            const t00 = c * v00 - s * v10, t01 = c * v01 - s * v11, t02 = c * v02 - s * v12;
+            const t10 = s * v00 + c * v10, t11 = s * v01 + c * v11, t12 = s * v02 + c * v12;
+            v00 = t00; v01 = t01; v02 = t02; v10 = t10; v11 = t11; v12 = t12;
+        } else if (p === 0 && q === 2) {
+            const a00n = c * c * a00 - 2 * s * c * a02 + s * s * a22;
+            const a22n = s * s * a00 + 2 * s * c * a02 + c * c * a22;
+            const a02n = 0;
+            const a01n = c * a01 - s * a12;
+            const a12n = s * a01 + c * a12;
+            a00 = a00n; a22 = a22n; a02 = a02n; a01 = a01n; a12 = a12n;
+            const t00 = c * v00 - s * v20, t01 = c * v01 - s * v21, t02 = c * v02 - s * v22;
+            const t20 = s * v00 + c * v20, t21 = s * v01 + c * v21, t22 = s * v02 + c * v22;
+            v00 = t00; v01 = t01; v02 = t02; v20 = t20; v21 = t21; v22 = t22;
+        } else {
+            const a11n = c * c * a11 - 2 * s * c * a12 + s * s * a22;
+            const a22n = s * s * a11 + 2 * s * c * a12 + c * c * a22;
+            const a12n = 0;
+            const a01n = c * a01 - s * a02;
+            const a02n = s * a01 + c * a02;
+            a11 = a11n; a22 = a22n; a12 = a12n; a01 = a01n; a02 = a02n;
+            const t10 = c * v10 - s * v20, t11 = c * v11 - s * v21, t12 = c * v12 - s * v22;
+            const t20 = s * v10 + c * v20, t21 = s * v11 + c * v21, t22 = s * v12 + c * v22;
+            v10 = t10; v11 = t11; v12 = t12; v20 = t20; v21 = t21; v22 = t22;
+        }
+    }
+    // Eigenvalues roughly on diagonal a00, a11, a22 of transformed A
+    const evals = [a00, a11, a22];
+    const evecs = [new THREE.Vector3(v00, v01, v02), new THREE.Vector3(v10, v11, v12), new THREE.Vector3(v20, v21, v22)];
+    // Sort by eigenvalue descending
+    const idx = [0,1,2].sort((i,j) => evals[j] - evals[i]);
+    return {
+        val0: evals[idx[0]], val1: evals[idx[1]], val2: evals[idx[2]],
+        vec0: evecs[idx[0]], vec1: evecs[idx[1]], vec2: evecs[idx[2]]
+    };
+}
+
+function chooseBestMappingUsingPCA(axes, sizes, targetSize) {
+    // Try all permutations and signs mapping PCA axes to world X,Y,Z; keep right-handed
+    const perms = [
+        [0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]
+    ];
+    let best = null;
+    for (const p of perms) {
+        for (const sx of [-1,1]) {
+            for (const sy of [-1,1]) {
+                const ex = axes[p[0]].clone().multiplyScalar(sx).normalize();
+                const ey = axes[p[1]].clone().multiplyScalar(sy).normalize();
+                let ez = new THREE.Vector3().crossVectors(ex, ey).normalize();
+                if (ez.lengthSq() < 0.9) continue; // skip degenerate
+                // Build rotation matrix columns (ex,ey,ez)
+                const m = new THREE.Matrix4().makeBasis(ex, ey, ez);
+                // Sizes mapped to world axes
+                const mappedSizes = new THREE.Vector3(sizes.getComponent(p[0]), sizes.getComponent(p[1]), sizes.getComponent(p[2]));
+                // Uniform scale residual
+                const s = Math.min(
+                    targetSize.x / Math.max(1e-6, mappedSizes.x),
+                    targetSize.y / Math.max(1e-6, mappedSizes.y),
+                    targetSize.z / Math.max(1e-6, mappedSizes.z)
+                );
+                const rx = s * mappedSizes.x - targetSize.x;
+                const ry = s * mappedSizes.y - targetSize.y;
+                const rz = s * mappedSizes.z - targetSize.z;
+                // Cost: dimension residual + mild penalty for tilting up away from +Y to keep gravity sense reasonable
+                const upPenalty = Math.max(0, 1 - Math.max(0, ey.y));
+                const cost = rx*rx + ry*ry + rz*rz + upPenalty * 0.05 * (targetSize.x + targetSize.y + targetSize.z);
+                if (!best || cost < best.cost) {
+                    best = { cost, matrix: m, mappedSizes };
+                }
+            }
+        }
+    }
+    return best;
 }
