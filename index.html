@@ -36,9 +36,15 @@
             <div id="skinDebug" style="position:absolute; left:8px; top:8px; font-size:11px; color:#fff; background:rgba(0,0,0,0.4); padding:4px 6px; border-radius:4px; z-index:200; display:none;"></div>
         </div>
         <div id="transformHud" class="transform-hud" style="display:none;">
-            <button id="hudMove" class="hud-btn">Move</button>
-            <button id="hudRotate" class="hud-btn">Rotate</button>
-            <button id="hudScale" class="hud-btn">Scale</button>
+            <div class="transform-hud-header">
+                <span>Transform</span>
+                <button class="transform-hud-toggle">▼</button>
+            </div>
+            <div class="transform-hud-controls">
+                <button id="hudMove" class="hud-btn">Move</button>
+                <button id="hudRotate" class="hud-btn">Rotate</button>
+                <button id="hudScale" class="hud-btn">Scale</button>
+            </div>
         </div>
         
         <div id="buildify-menu" class="buildify-menu" style="display: none;">

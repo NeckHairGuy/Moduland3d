@@ -45,6 +45,7 @@ let tripoTransformControls = null;
 // Screen-space skins per structure
 let structureIdToSkinUrls = new Map(); // id -> array of skin image URLs
 let activeSkinIndex = new Map(); // id -> current index
+let structureGalleries = new Map(); // id -> array of gallery items HTML
 let skinOverlayMesh = null; // current skin overlay mesh in scene
 let skinEls = new Map(); // id -> wrapper div element
 let skinAdjustActive = false;
@@ -341,6 +342,9 @@ function setupEventListeners() {
             if (selectedVoxels.length > 0) {
                 createGizmos();
             }
+        } else if (event.key === 'f' || event.key === 'F') {
+            event.preventDefault();
+            toggleFocusMode();
         } else if (tripoTransformControls) {
             // W/E/R when transform controls are present
             if (event.key === 'w' || event.key === 'W') {
@@ -354,9 +358,6 @@ function setupEventListeners() {
             event.preventDefault();
             clearSelection();
             hideGizmos();
-        } else if (event.key === 'f' || event.key === 'F') {
-            event.preventDefault();
-            toggleFocusMode();
         } else if (event.key === 'Delete' || event.key === 'Backspace') {
             event.preventDefault();
             deleteSelectedVoxels();
@@ -620,6 +621,8 @@ function updateAllVoxelColors() {
 }
 
 function toggleFocusMode() {
+    console.log(`Focus mode toggle: currently ${focusMode ? 'ON' : 'OFF'}, focusedStructure: ${focusedStructure ? focusedStructure.id : 'null'}`);
+    
     if (!focusMode) {
         // Enter focus mode - only allow if a structure is loaded
         if (!focusedStructure) {
@@ -636,6 +639,11 @@ function toggleFocusMode() {
 
 function enterFocusMode() {
     focusMode = true;
+    
+    // Show transform controls if a model is placed
+    if (tripoModelGroup && tripoPlacementEnabled) {
+        attachTripoTransformControls(tripoModelGroup);
+    }
     
     // Initialize the focused structure voxels set with current structure voxels
     focusedStructureVoxels.clear();
@@ -685,6 +693,9 @@ function enterFocusMode() {
 
 function exitFocusMode() {
     focusMode = false;
+    
+    // Hide transform controls when exiting focus mode
+    detachTripoTransformControls();
 
     // If procedural building is shown, clear and reset toggle
     try {
@@ -921,9 +932,7 @@ async function handleCaptureStructure() {
 
         restore();
 
-        // Clear gallery and show only these two
-        const gallery = document.getElementById('captureGallery');
-        if (gallery) gallery.innerHTML = '';
+        // Add captured images to gallery (don't clear existing)
         displayCapturedImages([
             { label: 'ISOMETRIC COLOR', dataUrl: isoColorUrl },
             { label: 'ISOMETRIC DEPTH', dataUrl: isoDepthUrl }
@@ -938,13 +947,68 @@ async function handleCaptureStructure() {
 function displayCapturedImages(images) {
     const gallery = document.getElementById('captureGallery');
     if (!gallery) return;
-    gallery.innerHTML = '';
+    // Don't clear gallery - append new images to existing ones
     images.forEach(img => {
         appendGalleryImage(img.label, img.dataUrl, focusedStructure ? focusedStructure.id : undefined);
     });
+    // Save gallery state for current structure
+    saveCurrentGalleryState();
     // Ensure bottom bar list is visible by updating menu
     updateStructuresMenu();
     persistStateIfEnabled();
+}
+
+function saveCurrentGalleryState() {
+    if (!focusedStructure) return;
+    const gallery = document.getElementById('captureGallery');
+    if (!gallery) return;
+    
+    // Save current gallery HTML for this structure
+    structureGalleries.set(focusedStructure.id, gallery.innerHTML);
+}
+
+function loadGalleryForStructure(structureId) {
+    const gallery = document.getElementById('captureGallery');
+    if (!gallery) return;
+    
+    // Load saved gallery HTML for this structure
+    const savedGallery = structureGalleries.get(structureId);
+    if (savedGallery !== undefined) {
+        gallery.innerHTML = savedGallery;
+    } else {
+        gallery.innerHTML = '';
+    }
+    
+    // Re-attach event listeners for Tripo items
+    reattachGalleryEventListeners();
+}
+
+function reattachGalleryEventListeners() {
+    const gallery = document.getElementById('captureGallery');
+    if (!gallery) return;
+    
+    gallery.querySelectorAll('.capture-item').forEach(item => {
+        // Re-attach place/remove button listeners for Tripo items
+        const placeBtn = item.querySelector('.place-remove-btn');
+        if (placeBtn) {
+            const glbUrl = item.dataset.glb;
+            const structureId = item.dataset.structureId;
+            placeBtn.addEventListener('click', async (e) => {
+                const btn = e.target;
+                if (btn.dataset.action === 'place') {
+                    await enableTripoPlacement(glbUrl, structureId || (focusedStructure && focusedStructure.id));
+                    btn.textContent = 'Remove';
+                    btn.dataset.action = 'remove';
+                    btn.style.background = '#f44336';
+                } else {
+                    disableTripoPlacement();
+                    btn.textContent = 'Place in Scene';
+                    btn.dataset.action = 'place';
+                    btn.style.background = '#4CAF50';
+                }
+            });
+        }
+    });
 }
 
 function appendGalleryImage(label, dataUrl, structureId) {
@@ -1289,6 +1353,56 @@ function hideOriginalFocusedStructure() {
         v.visible = false;
         if (v.userData.edges) v.userData.edges.visible = false;
     });
+}
+
+// Track visibility state for each structure
+const structureVisibilityStates = new Map();
+
+function toggleStructureVisibility(structureId, button) {
+    // Find the structure
+    const structure = savedStructures.find(s => s.id === structureId);
+    if (!structure) return;
+    
+    // Get current visibility state (default to true if not set)
+    const currentVisibility = structureVisibilityStates.get(structureId) !== false;
+    const newVisibility = !currentVisibility;
+    structureVisibilityStates.set(structureId, newVisibility);
+    
+    // Find all voxels that belong to this structure
+    const targetVoxels = [];
+    structure.data.forEach(voxelData => {
+        const targetPos = new THREE.Vector3().fromArray(voxelData.position);
+        targetPos.x = Math.round(targetPos.x);
+        targetPos.y = Math.round(targetPos.y);
+        targetPos.z = Math.round(targetPos.z);
+        
+        // Search through all existing voxels
+        const allObjects = [...groundGrid.flat(), ...voxels];
+        const matchingVoxel = allObjects.find(voxel => {
+            const voxelPos = voxel.position;
+            return Math.round(voxelPos.x) === targetPos.x &&
+                   Math.round(voxelPos.y) === targetPos.y &&
+                   Math.round(voxelPos.z) === targetPos.z;
+        });
+        
+        if (matchingVoxel) {
+            targetVoxels.push(matchingVoxel);
+        }
+    });
+    
+    // Toggle visibility for all found voxels
+    targetVoxels.forEach(v => {
+        if (v && v.parent) {
+            v.visible = newVisibility;
+            if (v.userData && v.userData.edges) {
+                v.userData.edges.visible = newVisibility;
+            }
+        }
+    });
+    
+    // Update button appearance
+    button.textContent = newVisibility ? '👁' : '👁‍🗨';
+    button.style.opacity = newVisibility ? '1' : '0.5';
 }
 
 function regenerateProceduralBuilding() {
@@ -1713,6 +1827,9 @@ function startGizmoDrag(gizmo, event) {
 function updateDragPreview(event) {
     clearDragPreview();
     
+    // Check if dragStartPos exists
+    if (!dragStartPos) return;
+    
     const dragDistance = Math.abs(event.clientX - dragStartPos.x) + Math.abs(event.clientY - dragStartPos.y);
     const extendAmount = Math.max(1, Math.floor(dragDistance / 50));
     
@@ -1880,7 +1997,10 @@ function updateStructuresMenu() {
             <div class="structure-preview" style="position:relative;"></div>
             <div class="structure-name" style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
                 <span>${structure.name}</span>
-                <button class="structure-delete" title="Delete" style="font-size:12px; padding:2px 6px;">🗑</button>
+                <div style="display:flex; gap:4px;">
+                    <button class="structure-visibility" title="Toggle Visibility" style="font-size:12px; padding:2px 6px;">👁</button>
+                    <button class="structure-delete" title="Delete" style="font-size:12px; padding:2px 6px;">🗑</button>
+                </div>
             </div>
             <div class="skin-controls">
                 <button class="skin-btn skin-left">◀</button>
@@ -1889,6 +2009,14 @@ function updateStructuresMenu() {
             </div>
         `;
         item.addEventListener('click', () => loadStructure(structure));
+        
+        // Visibility button
+        const visBtn = item.querySelector('.structure-visibility');
+        visBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleStructureVisibility(structure.id, visBtn);
+        });
+        
         // Skin buttons
         const left = item.querySelector('.skin-left');
         const right = item.querySelector('.skin-right');
@@ -1906,10 +2034,16 @@ function updateStructuresMenu() {
 }
 
 function loadStructure(structure) {
+    // Save current gallery state before switching
+    saveCurrentGalleryState();
+    
     clearSelection();
     
     // Set this as the focused structure (for potential focus mode)
     focusedStructure = structure;
+    
+    // Load the gallery for this structure
+    loadGalleryForStructure(structure.id);
     
     // Find existing voxels that match the saved structure positions
     structure.data.forEach(voxelData => {
@@ -2295,6 +2429,7 @@ function attachFalResult(imageUrl) {
     });
     const gallery = document.getElementById('captureGallery');
     gallery && gallery.prepend(item);
+    saveCurrentGalleryState();
     persistStateIfEnabled();
 }
 
@@ -2507,9 +2642,9 @@ function attachTripoResult(glbUrl, previewUrl, sourceStructureId = null) {
         </div>
         <div class="tripo-viewer" style="height: 320px; background: #f6f6f6; border: 1px solid #e6e6e6; border-radius: 4px;"></div>
         <div class="capture-actions" style="margin-top: 8px; display: flex; align-items: center; gap: 12px;">
-            <label class="toggle-label" style="display:flex; align-items:center; gap:6px;">
-                <input type="checkbox" class="place-in-scene-toggle" /> Place in scene (replace structure)
-            </label>
+            <button class="place-remove-btn" data-action="place" style="padding: 6px 12px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                Place in Scene
+            </button>
         </div>
     `;
     item.querySelector('.download-btn').addEventListener('click', async () => {
@@ -2520,12 +2655,20 @@ function attachTripoResult(glbUrl, previewUrl, sourceStructureId = null) {
     gallery && gallery.prepend(item);
     const container = item.querySelector('.tripo-viewer');
     initTripoViewer(container, glbUrl);
-    const toggle = item.querySelector('.place-in-scene-toggle');
-    toggle.addEventListener('change', async (e) => {
-        if (e.target.checked) {
+    saveCurrentGalleryState();
+    const placeBtn = item.querySelector('.place-remove-btn');
+    placeBtn.addEventListener('click', async (e) => {
+        const btn = e.target;
+        if (btn.dataset.action === 'place') {
             await enableTripoPlacement(glbUrl, sourceStructureId || (focusedStructure && focusedStructure.id));
+            btn.textContent = 'Remove';
+            btn.dataset.action = 'remove';
+            btn.style.background = '#f44336';
         } else {
             disableTripoPlacement();
+            btn.textContent = 'Place in Scene';
+            btn.dataset.action = 'place';
+            btn.style.background = '#4CAF50';
         }
     });
     const toolButtons = item.querySelectorAll('.tripo-tools .buildify-btn');
@@ -2611,12 +2754,7 @@ async function enableTripoPlacement(glbUrl, structureId = null) {
     // The center of the structure bounds
     const targetCenter = new THREE.Vector3().addVectors(bounds.min, bounds.max).multiplyScalar(0.5);
     
-    console.log('Placement Debug:', {
-        structureId,
-        bounds: { min: bounds.min.toArray(), max: bounds.max.toArray() },
-        structureSize: structureSize.toArray(),
-        targetCenter: targetCenter.toArray()
-    });
+    // Removed placement debug logging
 
     // Reset transforms before analysis
     gltfRoot.rotation.set(0, 0, 0);
@@ -2633,65 +2771,103 @@ async function enableTripoPlacement(glbUrl, structureId = null) {
     gltfRoot.position.sub(modelCenter);
     gltfRoot.updateMatrixWorld(true);
 
-    // Check if we should rotate the model to better align with the structure
-    const modelBoxAtOrigin = new THREE.Box3().setFromObject(gltfRoot);
-    const modelSizeAtOrigin = modelBoxAtOrigin.getSize(new THREE.Vector3());
+    // Get model size at origin
+    let modelBoxAtOrigin = new THREE.Box3().setFromObject(gltfRoot);
+    let modelSizeAtOrigin = modelBoxAtOrigin.getSize(new THREE.Vector3());
     
-    // Find the longest axes for both model and structure
-    const modelMaxAxis = Math.max(modelSizeAtOrigin.x, modelSizeAtOrigin.y, modelSizeAtOrigin.z);
-    const structMaxAxis = Math.max(structureSize.x, structureSize.y, structureSize.z);
+    // Fine-grained Y-axis rotation search to match structure dimensions
+    let bestRotation = 0;
+    let bestScore = Infinity;
     
-    // Simple 90-degree rotation check: if model's height is its longest dimension
-    // but structure is wider/deeper than tall, rotate the model
-    if (modelSizeAtOrigin.y === modelMaxAxis && structureSize.y !== structMaxAxis) {
-        // Rotate 90 degrees around X axis to lay the model down
-        gltfRoot.rotation.x = Math.PI / 2;
+    // Test rotations in 5-degree increments for full 360 degrees
+    const numSteps = 72; // 360 / 5
+    for (let i = 0; i < numSteps; i++) {
+        const rotation = (i * 5) * Math.PI / 180;
+        gltfRoot.rotation.y = rotation;
         gltfRoot.updateMatrixWorld(true);
-        // Recalculate bounding box after rotation
-        const rotatedBox = new THREE.Box3().setFromObject(gltfRoot);
-        modelSizeAtOrigin.copy(rotatedBox.getSize(new THREE.Vector3()));
+        
+        const testBox = new THREE.Box3().setFromObject(gltfRoot);
+        const testSize = testBox.getSize(new THREE.Vector3());
+        
+        // Calculate how well the model dimensions match the structure
+        // We want the model's X dimension to match structure's X, and Z to match Z
+        const xDiff = Math.abs(testSize.x - (structureSize.x + 1));
+        const zDiff = Math.abs(testSize.z - (structureSize.z + 1));
+        
+        // Also check if swapping X and Z gives a better match
+        const xzSwapDiffX = Math.abs(testSize.z - (structureSize.x + 1));
+        const xzSwapDiffZ = Math.abs(testSize.x - (structureSize.z + 1));
+        
+        // Use the configuration with the smallest total difference
+        const directScore = xDiff + zDiff;
+        const swapScore = xzSwapDiffX + xzSwapDiffZ;
+        const score = Math.min(directScore, swapScore);
+        
+        if (score < bestScore) {
+            bestScore = score;
+            bestRotation = rotation;
+            modelSizeAtOrigin = testSize.clone();
+        }
     }
     
-    // Calculate scale to fit the structure bounds
-    // Add 1 to each dimension to account for voxel size (voxels occupy full 1x1x1 space)
-    const scaleX = (structureSize.x + 1) / modelSizeAtOrigin.x;
-    const scaleY = (structureSize.y + 1) / modelSizeAtOrigin.y;
-    const scaleZ = (structureSize.z + 1) / modelSizeAtOrigin.z;
+    // Apply the best rotation found
+    gltfRoot.rotation.y = bestRotation;
+    gltfRoot.updateMatrixWorld(true);
+    modelBoxAtOrigin = new THREE.Box3().setFromObject(gltfRoot);
+    modelSizeAtOrigin = modelBoxAtOrigin.getSize(new THREE.Vector3());
     
-    // Use the minimum scale to ensure the model fits within bounds while maintaining proportions
-    const uniformScale = Math.min(scaleX, scaleY, scaleZ);
+    console.log(`Model rotated by ${(bestRotation * 180 / Math.PI).toFixed(1)}°`);
+    
+    // Calculate scale to match structure bounds
+    // Since voxels are 1x1x1 and positioned at integer coordinates,
+    // a structure from x=0 to x=2 actually spans 3 units (3 voxels)
+    const actualStructureSize = new THREE.Vector3(
+        structureSize.x + 1,  // Add 1 because bounds are inclusive
+        structureSize.y + 1,
+        structureSize.z + 1
+    );
+    
+    const scaleX = actualStructureSize.x / modelSizeAtOrigin.x;
+    const scaleY = actualStructureSize.y / modelSizeAtOrigin.y;
+    const scaleZ = actualStructureSize.z / modelSizeAtOrigin.z;
+    
+    // Use the median scale for better overall fit
+    const scales = [scaleX, scaleY, scaleZ].sort((a, b) => a - b);
+    let uniformScale = scales[1]; // median
+    
+    // Apply a scale correction factor since models appear 2/3 of correct size
+    uniformScale *= 1.5;
     
     gltfRoot.scale.setScalar(uniformScale);
     gltfRoot.updateMatrixWorld(true);
 
-    // Position the model so its center aligns with the target structure center
-    // The model is already centered at origin, so we just need to move it to the target
+    // Get the final bounding box after scaling
+    const scaledBox = new THREE.Box3().setFromObject(gltfRoot);
+    
+    // Position the model so it sits on the grid at the structure's position
+    // Align the bottom of the model with the bottom of the structure
+    const yOffset = bounds.min.y - scaledBox.min.y;
+    
     const finalPosition = new THREE.Vector3(
         targetCenter.x,
-        targetCenter.y,
+        yOffset,
         targetCenter.z
     );
     
     gltfRoot.position.copy(finalPosition);
     
-    console.log('Final Position Debug:', {
-        modelPosition: gltfRoot.position.toArray(),
-        targetCenter: targetCenter.toArray(),
-        boundsMin: bounds.min.toArray(),
-        boundsMax: bounds.max.toArray(),
-        uniformScale: uniformScale,
-        modelSizeAtOrigin: modelSizeAtOrigin.toArray(),
-        structureSize: structureSize.toArray(),
-        scales: { scaleX, scaleY, scaleZ }
-    });
+    console.log(`Model scaled by ${uniformScale.toFixed(2)}x and positioned at (${gltfRoot.position.x.toFixed(1)}, ${gltfRoot.position.y.toFixed(1)}, ${gltfRoot.position.z.toFixed(1)})`);
 
     tripoModelGroup = new THREE.Group();
     tripoModelGroup.userData.isTripoModel = true;
     tripoModelGroup.add(gltfRoot);
     scene.add(tripoModelGroup);
-    if (focusMode && focusedStructureVoxels.size > 0) hideOriginalFocusedStructure();
+    // Don't automatically hide the structure - let user control visibility
     tripoPlacementEnabled = true;
-    await attachTripoTransformControls(tripoModelGroup);
+    // Only show transform controls in focus mode
+    if (focusMode) {
+        await attachTripoTransformControls(tripoModelGroup);
+    }
 }
 
 function chooseBestAxisAlignedRotation(modelSize, targetSize) {
@@ -2835,26 +3011,33 @@ function addLocalGlbCard(glbUrl, onCleanup) {
         </div>
         <div class="tripo-viewer" style="height: 320px; background: #f6f6f6; border: 1px solid #e6e6e6; border-radius: 4px;"></div>
         <div class="capture-actions" style="margin-top: 8px; display: flex; align-items: center; gap: 12px;">
-            <label class="toggle-label" style="display:flex; align-items:center; gap:6px;">
-                <input type="checkbox" class="place-in-scene-toggle" /> Place in scene
-            </label>
+            <button class="place-remove-btn" data-action="place" style="padding: 6px 12px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                Place in Scene
+            </button>
         </div>
     `;
     gallery && gallery.prepend(item);
     const container = item.querySelector('.tripo-viewer');
     initTripoViewer(container, glbUrl);
-    const toggle = item.querySelector('.place-in-scene-toggle');
-    toggle.addEventListener('change', async (e) => {
-        if (e.target.checked) {
+    saveCurrentGalleryState();
+    const placeBtn = item.querySelector('.place-remove-btn');
+    placeBtn.addEventListener('click', async (e) => {
+        const btn = e.target;
+        if (btn.dataset.action === 'place') {
             try {
                 await enableTripoPlacement(glbUrl);
+                btn.textContent = 'Remove';
+                btn.dataset.action = 'remove';
+                btn.style.background = '#f44336';
             } catch (err) {
                 console.error('Placement failed:', err);
                 alert('Placement failed. See console for details.');
-                e.target.checked = false;
             }
         } else {
             disableTripoPlacement();
+            btn.textContent = 'Place in Scene';
+            btn.dataset.action = 'place';
+            btn.style.background = '#4CAF50';
         }
     });
     if (onCleanup) {
@@ -2911,23 +3094,93 @@ async function attachTripoTransformControls(target) {
     tripoTransformControls = new TransformControlsCtor(camera, renderer.domElement);
     tripoTransformControls.setMode('translate');
     tripoTransformControls.setSpace('world');
+    let lastRotation = { x: 0, y: 0, z: 0 };
+    let lastScale = 1;
+    
     tripoTransformControls.addEventListener('dragging-changed', (e) => {
         isDraggingGizmo = e.value;
+        
+        // Log changes when dragging ends
+        if (!e.value && target) {
+            const mode = typeof tripoTransformControls.getMode === 'function' ? tripoTransformControls.getMode() : tripoTransformControls.mode;
+            
+            if (mode === 'rotate') {
+                const currentRotation = {
+                    x: target.rotation.x * 180 / Math.PI,
+                    y: target.rotation.y * 180 / Math.PI,
+                    z: target.rotation.z * 180 / Math.PI
+                };
+                const deltaX = currentRotation.x - lastRotation.x;
+                const deltaY = currentRotation.y - lastRotation.y;
+                const deltaZ = currentRotation.z - lastRotation.z;
+                
+                if (Math.abs(deltaX) > 0.1) console.log(`Rotated X by ${deltaX.toFixed(1)}°`);
+                if (Math.abs(deltaY) > 0.1) console.log(`Rotated Y by ${deltaY.toFixed(1)}°`);
+                if (Math.abs(deltaZ) > 0.1) console.log(`Rotated Z by ${deltaZ.toFixed(1)}°`);
+                
+                lastRotation = currentRotation;
+            }
+            
+            if (mode === 'scale') {
+                const currentScale = target.scale.x;
+                const deltaScale = currentScale / lastScale;
+                if (Math.abs(deltaScale - 1) > 0.01) {
+                    console.log(`Scaled by ${deltaScale.toFixed(2)}x (now ${currentScale.toFixed(2)}x total)`);
+                }
+                lastScale = currentScale;
+            }
+        }
     });
+    
+    // Store initial values
+    if (target) {
+        lastRotation = {
+            x: target.rotation.x * 180 / Math.PI,
+            y: target.rotation.y * 180 / Math.PI,
+            z: target.rotation.z * 180 / Math.PI
+        };
+        lastScale = target.scale.x;
+    }
+    
     // Enforce uniform scale when in scale mode
+    let initialScale = target ? target.scale.x : 1;
     tripoTransformControls.addEventListener('objectChange', () => {
         const mode = typeof tripoTransformControls.getMode === 'function' ? tripoTransformControls.getMode() : tripoTransformControls.mode;
         if (mode === 'scale' && target) {
             const s = target.scale;
-            const factor = Math.max(s.x, s.y, s.z);
+            // Find which axis changed the most from the initial scale
+            const deltaX = Math.abs(s.x - initialScale);
+            const deltaY = Math.abs(s.y - initialScale);
+            const deltaZ = Math.abs(s.z - initialScale);
+            
+            let factor;
+            if (deltaX >= deltaY && deltaX >= deltaZ) {
+                factor = s.x;
+            } else if (deltaY >= deltaZ) {
+                factor = s.y;
+            } else {
+                factor = s.z;
+            }
+            
             target.scale.setScalar(factor);
+            initialScale = factor;
         }
     });
     tripoTransformControls.attach(target);
     scene.add(tripoTransformControls);
     // show HUD
     const hud = document.getElementById('transformHud');
-    if (hud) hud.style.display = 'flex';
+    if (hud) {
+        hud.style.display = 'block';
+        // Add collapse functionality if not already added
+        const toggleBtn = hud.querySelector('.transform-hud-toggle');
+        if (toggleBtn && !toggleBtn.hasAttribute('data-listener-added')) {
+            toggleBtn.setAttribute('data-listener-added', 'true');
+            toggleBtn.addEventListener('click', () => {
+                hud.classList.toggle('collapsed');
+            });
+        }
+    }
 }
 
 function detachTripoTransformControls() {
@@ -3133,7 +3386,7 @@ function updateScreenOverlayVisibility() {
     camera.getWorldDirection(curDir);
     const dot = curDir.normalize().dot(defaultDir);
     layer.style.display = (dot > 0.995) ? 'block' : 'none';
-    debugLog('skin:visibility', { dot, display: layer.style.display, curDir: {x:curDir.x.toFixed(3),y:curDir.y.toFixed(3),z:curDir.z.toFixed(3)}, defaultDir: {x:defaultDir.x.toFixed(3),y:defaultDir.y.toFixed(3),z:defaultDir.z.toFixed(3)} });
+    // Removed skin visibility debug logging
 }
 
 function updateScreenOverlayTransform() {

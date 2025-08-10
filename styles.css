@@ -393,13 +393,54 @@ body {
 .transform-hud {
     position: absolute;
     bottom: 16px;
-    left: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.7);
+    padding: 8px;
+    border-radius: 8px;
+    z-index: 10;
+    transition: all 0.3s ease;
+}
+
+.transform-hud.collapsed {
+    padding: 6px;
+}
+
+.transform-hud-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+    color: white;
+    font-size: 12px;
+    font-weight: bold;
+}
+
+.transform-hud.collapsed .transform-hud-header {
+    margin-bottom: 0;
+}
+
+.transform-hud-toggle {
+    background: none;
+    border: none;
+    color: white;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 6px;
+    transition: transform 0.3s ease;
+}
+
+.transform-hud.collapsed .transform-hud-toggle {
+    transform: rotate(180deg);
+}
+
+.transform-hud-controls {
     display: flex;
     gap: 8px;
-    background: rgba(0,0,0,0.5);
-    padding: 6px 8px;
-    border-radius: 6px;
-    z-index: 10;
+}
+
+.transform-hud.collapsed .transform-hud-controls {
+    display: none;
 }
 
 .skin-overlay-layer {
