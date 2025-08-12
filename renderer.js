@@ -18,9 +18,11 @@ let currentTool = 'select';
 let gridSizeX = 20;
 let gridSizeZ = 20;
 let voxelSize = 1;
-// Default isometric view angles (degrees)
-const DEFAULT_ISO_ELEVATION_DEG = 35.264; // classic iso elevation ~arctan(sin(45))
-const DEFAULT_ISO_AZIMUTH_DEG = 45;       // classic iso azimuth
+// Real-world meter length represented by one voxel segment. Adjust as desired.
+const METERS_PER_SEGMENT = 4;
+// Default isometric camera angles used throughout renderer
+const DEFAULT_ISO_ELEVATION_DEG = 35.264; // arctan(sin45)
+const DEFAULT_ISO_AZIMUTH_DEG = 45;
 let gizmoGroup;
 let activeGizmo = null;
 let isDraggingGizmo = false;
@@ -2951,7 +2953,7 @@ async function sendImageToTripo(imageUrl) {
                 'Authorization': `Key ${apiKey}`,
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ image_url: imageUrl, texture: 'standard', texture_alignment: 'original_image', orientation: 'align_image' })
+            body: JSON.stringify({ image_url: imageUrl, texture: 'standard', texture_alignment: 'original_image', orientation: 'align_image', auto_size: true })
         });
         if (res.ok) {
             data = await res.json();
@@ -2972,7 +2974,7 @@ async function sendImageToTripo(imageUrl) {
             }
             if (fal?.config) { try { fal.config({ credentials: apiKey }); } catch {} }
             const result = await fal.subscribe('tripo3d/tripo/v2.5/image-to-3d', {
-                input: { image_url: imageUrl, texture: 'standard', texture_alignment: 'original_image', orientation: 'align_image' },
+                input: { image_url: imageUrl, texture: 'standard', texture_alignment: 'original_image', orientation: 'align_image', auto_size: true },
                 logs: true
             });
             data = result?.data || result;
@@ -3147,6 +3149,13 @@ async function enableTripoPlacement(glbUrl, structureId = null) {
     gltfRoot.scale.set(1, 1, 1);
     gltfRoot.position.set(0, 0, 0);
     gltfRoot.updateMatrixWorld(true);
+
+    // Convert Tripo metres into Buildify segments (1 seg = METERS_PER_SEGMENT m)
+    gltfRoot.scale.multiplyScalar(1 / METERS_PER_SEGMENT);
+
+    // Center root at origin for analysis
+    const box = new THREE.Box3().setFromObject(gltfRoot);
+    const size = box.getSize(new THREE.Vector3());
 
     // Compute model bbox at its native scale
     const modelBox = new THREE.Box3().setFromObject(gltfRoot);
