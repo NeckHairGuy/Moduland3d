@@ -1270,6 +1270,15 @@ function reattachGalleryEventListeners() {
             });
         }
         
+        // If this is a TRIPO item, ensure viewer initialized and buttons wired
+        if (itemType === 'tripo') {
+            const viewer = item.querySelector('.tripo-viewer');
+            const glbUrl = item.dataset.glb;
+            if (viewer && glbUrl && viewer.childElementCount === 0) {
+                initTripoViewer(viewer, glbUrl);
+            }
+        }
+        
         // Re-attach place/remove button listeners for Tripo items
         const placeBtn = item.querySelector('.place-remove-btn');
         if (placeBtn) {
@@ -1277,17 +1286,19 @@ function reattachGalleryEventListeners() {
             placeBtn.addEventListener('click', async (e) => {
                 const btn = e.target;
                 if (btn.dataset.action === 'place') {
+                    const sid = structureId != null ? structureId : (focusedStructure && focusedStructure.id);
                     const useVisualization = document.getElementById('enablePlacementVisualization')?.checked;
                     if (useVisualization) {
-                        await enableTripoPlacementWithVisualization(glbUrl, structureId || (focusedStructure && focusedStructure.id));
+                        await enableTripoPlacementWithVisualization(glbUrl, sid);
                     } else {
-                        await enableTripoPlacement(glbUrl, structureId || (focusedStructure && focusedStructure.id));
+                        await enableTripoPlacement(glbUrl, sid);
                     }
                     btn.textContent = 'Remove';
                     btn.dataset.action = 'remove';
                     btn.style.background = '#f44336';
                 } else {
-                    disableTripoPlacement(structureId || (focusedStructure && focusedStructure.id));
+                    const sid = structureId != null ? structureId : (focusedStructure && focusedStructure.id);
+                    disableTripoPlacement(sid);
                     btn.textContent = 'Place in Scene';
                     btn.dataset.action = 'place';
                     btn.style.background = '#4CAF50';
