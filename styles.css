@@ -683,3 +683,151 @@ body {
     border-radius: 3px;
     padding: 2px 6px;
 }
+
+/* Step-by-step placement visualization */
+.placement-visualizer {
+    position: fixed;
+    top: 20px;
+    left: 20px;
+    background: rgba(0, 0, 0, 0.95);
+    border: 2px solid #4444ff;
+    border-radius: 8px;
+    padding: 20px;
+    width: 380px;
+    max-height: calc(100vh - 200px);
+    z-index: 2000;
+    color: white;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.8);
+    overflow-y: auto;
+}
+
+.placement-visualizer h3 {
+    margin: 0 0 15px 0;
+    color: #4444ff;
+    text-align: center;
+    font-size: 18px;
+}
+
+.step-content {
+    margin-bottom: 20px;
+    min-height: 120px;
+}
+
+.step-title {
+    color: #fff;
+    font-size: 16px;
+    font-weight: bold;
+    margin-bottom: 10px;
+}
+
+.step-description {
+    color: #ccc;
+    font-size: 14px;
+    line-height: 1.4;
+    margin-bottom: 15px;
+}
+
+.step-values {
+    background: #2a2a2a;
+    border: 1px solid #4a4a4a;
+    border-radius: 4px;
+    padding: 10px;
+    font-family: monospace;
+    font-size: 12px;
+    white-space: pre-wrap;
+}
+
+.step-navigation {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-top: 1px solid #4a4a4a;
+    padding-top: 15px;
+}
+
+.step-counter {
+    color: #aaa;
+    font-size: 14px;
+}
+
+.nav-buttons {
+    display: flex;
+    gap: 10px;
+}
+
+.nav-btn {
+    padding: 8px 16px;
+    background: #4444ff;
+    border: 1px solid #5555ff;
+    color: white;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: background 0.2s;
+}
+
+.nav-btn:hover {
+    background: #5555ff;
+}
+
+.nav-btn:disabled {
+    background: #333;
+    border-color: #444;
+    color: #666;
+    cursor: not-allowed;
+}
+
+.close-visualizer {
+    position: absolute;
+    top: 10px;
+    right: 15px;
+    background: none;
+    border: none;
+    color: #999;
+    font-size: 20px;
+    cursor: pointer;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.close-visualizer:hover {
+    background: #4a4a4a;
+    color: #fff;
+}
+
+/* Visual indicators for placement steps */
+.placement-indicator {
+    position: absolute;
+    pointer-events: none;
+    z-index: 1500;
+}
+
+.placement-box {
+    border: 2px solid #ff4444;
+    background: rgba(255, 68, 68, 0.1);
+}
+
+.placement-arrow {
+    position: absolute;
+    width: 0;
+    height: 0;
+    border-left: 10px solid transparent;
+    border-right: 10px solid transparent;
+    border-bottom: 20px solid #ffff44;
+}
+
+.placement-label {
+    position: absolute;
+    background: rgba(0, 0, 0, 0.8);
+    color: white;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    white-space: nowrap;
+}

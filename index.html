@@ -54,7 +54,11 @@
             </div>
             <div class="buildify-content">
                 <div class="buildify-section">
-                    <button id="captureStructureBtn" class="buildify-btn primary">Capture Structure</button>
+                    <div class="capture-preview-container" style="position: relative; width: 100%; aspect-ratio: 1; background: #1a1a1a; border: 1px solid #3a3a3a; border-radius: 4px; margin-bottom: 12px; display: flex; align-items: center; justify-content: center;">
+                        <div id="capturePreviewPlaceholder" style="color: #666; font-size: 12px;">No capture yet</div>
+                        <img id="capturePreviewImage" style="display: none; width: 100%; height: 100%; object-fit: cover; border-radius: 4px;" />
+                        <button id="captureStructureBtn" class="buildify-btn primary" style="position: absolute; top: 8px; right: 8px; padding: 6px 12px; font-size: 12px;">Capture Structure</button>
+                    </div>
                 </div>
                 <div class="buildify-section">
                     <label for="falPromptInput">Prompt</label>
@@ -115,11 +119,10 @@
                     </div>
                 </div>
                 <div class="buildify-section">
-                    <label>GLB testing</label>
-                    <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                        <button id="testLocalGlbBtn" class="buildify-btn">Load sample GLB</button>
-                        <label class="buildify-btn" for="uploadGlbInput" style="display:inline-flex; align-items:center; gap:8px; cursor:pointer;">Upload GLB<input id="uploadGlbInput" type="file" accept=".glb" style="display:none;" /></label>
-                    </div>
+                    <label>3D Model Placement</label>
+                    <label class="checkbox-label">
+                        <input id="enablePlacementVisualization" type="checkbox" checked /> Show step-by-step placement
+                    </label>
                 </div>
                 <div id="captureGallery" class="capture-gallery"></div>
             </div>
@@ -128,6 +131,25 @@
         <div id="structures-menu">
             <div class="menu-header">Saved Structures</div>
             <div id="structures-list"></div>
+        </div>
+    </div>
+
+    <div id="placementVisualizer" class="placement-visualizer" style="display: none;">
+        <button class="close-visualizer">×</button>
+        <h3>3D Model Placement Steps</h3>
+        <div class="step-content">
+            <div class="step-title" id="stepTitle">Step Title</div>
+            <div class="step-description" id="stepDescription">Step description goes here...</div>
+            <div class="step-values" id="stepValues">Values will be shown here</div>
+        </div>
+        <div class="step-navigation">
+            <div class="step-counter">
+                <span id="currentStep">1</span> / <span id="totalSteps">1</span>
+            </div>
+            <div class="nav-buttons">
+                <button id="prevStepBtn" class="nav-btn">← Previous</button>
+                <button id="nextStepBtn" class="nav-btn">Next →</button>
+            </div>
         </div>
     </div>
 

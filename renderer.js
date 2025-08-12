@@ -38,14 +38,17 @@ let buildingInstanceGroup = null;
 let originalStructureSnapshot = null;
 let renderBuildingEnabled = false;
 let __envLoaded = false;
-let tripoModelGroup = null;
+let tripoModelGroup = null; // Currently active model for transform controls
 let tripoPlacementEnabled = false;
 let cachedTripoGLB = null; // store loaded gltf.scene for reuse
 let tripoTransformControls = null;
+// Track all placed models by structure ID
+let placedModelsByStructure = new Map(); // structureId -> { group: THREE.Group, glbUrl: string }
 // Screen-space skins per structure
 let structureIdToSkinUrls = new Map(); // id -> array of skin image URLs
 let activeSkinIndex = new Map(); // id -> current index
 let structureGalleries = new Map(); // id -> array of gallery items HTML
+let latestCapturedImageUrl = null; // Store the latest captured image for Send to Flux
 let skinOverlayMesh = null; // current skin overlay mesh in scene
 let skinEls = new Map(); // id -> wrapper div element
 let skinAdjustActive = false;
@@ -54,7 +57,7 @@ let skinStates = new Map(); // id -> {x,y,scale}
 let lastPointer = null;
 let lastFalSeed = null;
 // Persistence
-const PERSIST_KEY = 'moduland_persist_state_v1';
+const PERSIST_KEY = 'moduland_persist_state_v2';
 const PERSIST_ENABLED_KEY = 'moduland_persist_enabled';
 
 function init() {
@@ -476,6 +479,8 @@ function onMouseUp(event) {
 }
 
 function toggleSelection(object) {
+    // Prevent selecting ground grid while in focus mode
+    if (focusMode && object?.userData?.type === 'ground') return;
     if (object.userData.isGizmo) return;
     
     const index = selectedVoxels.indexOf(object);
@@ -640,9 +645,14 @@ function toggleFocusMode() {
 function enterFocusMode() {
     focusMode = true;
     
-    // Show transform controls if a model is placed
-    if (tripoModelGroup && tripoPlacementEnabled) {
-        attachTripoTransformControls(tripoModelGroup);
+    // Show transform controls if the focused structure has a model
+    if (focusedStructure) {
+        const modelData = placedModelsByStructure.get(focusedStructure.id);
+        if (modelData && modelData.group) {
+            tripoModelGroup = modelData.group;
+            tripoPlacementEnabled = true;
+            attachTripoTransformControls(tripoModelGroup);
+        }
     }
     
     // Initialize the focused structure voxels set with current structure voxels
@@ -721,6 +731,13 @@ function exitFocusMode() {
         }
     });
     
+    // Restore all placed models to full visibility
+    placedModelsByStructure.forEach((modelData) => {
+        if (modelData.group) {
+            modelData.group.visible = true;
+        }
+    });
+    
     // Hide focus indicator
     const indicator = document.getElementById('focusIndicator');
     indicator.style.display = 'none';
@@ -745,8 +762,20 @@ function exitFocusMode() {
 function updateFocusModeVisibility() {
     if (!focusMode) return;
     
+    // Hide the flat white grid helper/plane in focus mode to prevent clipping
+    scene.children.forEach(child => {
+        const isGridOverlay = child.userData && (child.userData.isGridHelper || child.userData.isGridPlane);
+        if (isGridOverlay) child.visible = false;
+    });
+
     const allVoxels = [...groundGrid.flat(), ...voxels];
     allVoxels.forEach(voxel => {
+        // Always keep ground grid visible in focus mode to appear in captures
+        if (voxel.userData?.type === 'ground') {
+            voxel.visible = true;
+            if (voxel.userData.edges) voxel.userData.edges.visible = true;
+            return;
+        }
         // Show only voxels that are part of the focused structure
         const isVisible = focusedStructureVoxels.has(voxel);
         voxel.visible = isVisible;
@@ -754,6 +783,14 @@ function updateFocusModeVisibility() {
         // Also update edge visibility
         if (voxel.userData.edges) {
             voxel.userData.edges.visible = isVisible;
+        }
+    });
+    
+    // Show only models associated with the current focused structure
+    placedModelsByStructure.forEach((modelData, structureId) => {
+        const shouldShow = focusedStructure && structureId === focusedStructure.id;
+        if (modelData.group) {
+            modelData.group.visible = shouldShow;
         }
     });
 }
@@ -844,8 +881,6 @@ function setupBuildifyEvents() {
     const closeBuildify = document.getElementById('closeBuildify');
     const captureBtn = document.getElementById('captureStructureBtn');
     const sendFalDepthBtn = document.getElementById('sendFalDepthBtn');
-    const testLocalGlbBtn = document.getElementById('testLocalGlbBtn');
-    const uploadGlbInput = document.getElementById('uploadGlbInput');
 
     if (closeBuildify) {
         closeBuildify.addEventListener('click', () => {
@@ -871,34 +906,6 @@ function setupBuildifyEvents() {
         });
     }
 
-    if (testLocalGlbBtn) {
-        testLocalGlbBtn.addEventListener('click', async () => {
-            const sample = await resolveSampleGlbUrl();
-            if (!sample) {
-                const gallery = document.getElementById('captureGallery');
-                const item = document.createElement('div');
-                item.className = 'capture-item';
-                item.innerHTML = `
-                    <div class="capture-header"><div class="capture-label">LOCAL GLB</div></div>
-                    <div class="tripo-viewer" style="height: 120px; display:flex; align-items:center; justify-content:center; color:#b00; font-size:12px; background:#f6f6f6; border:1px solid #e6e6e6; border-radius:4px;">
-                        Running from file:// cannot load sample GLB. Use Upload GLB or run a local server.
-                    </div>
-                `;
-                gallery && gallery.prepend(item);
-                return;
-            }
-            addLocalGlbCard(sample);
-        });
-    }
-
-    if (uploadGlbInput) {
-        uploadGlbInput.addEventListener('change', async (e) => {
-            const file = e.target.files && e.target.files[0];
-            if (!file) return;
-            const objectUrl = URL.createObjectURL(file);
-            addLocalGlbCard(objectUrl, () => URL.revokeObjectURL(objectUrl));
-        });
-    }
 }
 
 async function handleCaptureStructure() {
@@ -915,29 +922,142 @@ async function handleCaptureStructure() {
         }
         const bounds = computeBoundsForVoxelSet(structureVoxels);
 
+        // Hide non-structure elements (and flat grid) but keep segmented ground visible
         const { restore } = isolateForCapture(structureVoxels);
 
-        // Only produce the two assets we actually use: Iso color (for FLUX) and Iso depth (preview/reference)
+        // Only capture the color image (remove depth capture)
         const size = 768;
         const camIso = createOrthoObliqueCameraToFit(bounds, size, size, DEFAULT_ISO_ELEVATION_DEG, DEFAULT_ISO_AZIMUTH_DEG);
         expandOrthoFrustum(camIso, 1.06);
         camIso.updateMatrixWorld(true);
 
+        // Build and place a high-detail voxel tree (0.1 segment voxels) at the front-lower corner
+        // Tree dimensions relative to segment: trunk height ~1.2, crown radius ~0.8
+        const addVoxelTree = (cam) => {
+            const treeGroup = new THREE.Group();
+            treeGroup.userData.__tempMarker = true;
+            const unit = 0.1 * voxelSize; // 1/10 of a segment
+            // Use the same blue as highlighted segments
+            const structColor = 0x4444ff;
+            const leafMat = new THREE.MeshPhongMaterial({ color: structColor });
+            const woodMat = leafMat; // same material/color per requirement
+            const makeVoxel = (x,y,z,mat) => {
+                const g = new THREE.BoxGeometry(unit, unit, unit);
+                const mesh = new THREE.Mesh(g, mat);
+                mesh.position.set(x, y, z);
+                treeGroup.add(mesh);
+            };
+            // Trunk (slightly tapered)
+            const trunkH = Math.round(1.35 / 0.1);
+            for (let iy = 0; iy < trunkH; iy++) {
+                const r = Math.max(1, Math.round((0.2 - iy * 0.2 / trunkH) / 0.1));
+                for (let ix = -r; ix <= r; ix++) {
+                    for (let iz = -r; iz <= r; iz++) {
+                        if (ix*ix + iz*iz <= r*r) makeVoxel(ix*unit, iy*unit, iz*unit, woodMat);
+                    }
+                }
+            }
+            // Branches: four branches at different heights and azimuths
+            const branchSpecs = [
+                { h: 0.6,  a: -35, len: 0.6 },
+                { h: 0.9,  a: 25,  len: 0.55 },
+                { h: 1.15, a: 70,  len: 0.5 },
+                { h: 1.05, a: 150, len: 0.45 }
+            ];
+            const toRad = (d)=>d*Math.PI/180;
+            for (const b of branchSpecs) {
+                const yBase = Math.round(b.h / 0.1) * unit;
+                const steps = Math.round(b.len / 0.1);
+                const dir = new THREE.Vector3(Math.cos(toRad(b.a)), 0, Math.sin(toRad(b.a)));
+                for (let s = 1; s <= steps; s++) {
+                    const p = dir.clone().multiplyScalar(s*unit);
+                    makeVoxel(p.x, yBase + Math.round(s*0.03/unit)*unit, p.z, woodMat);
+                    // branch thickness 1 voxel with occasional side voxel
+                    if (s % 3 === 0) {
+                        const side = new THREE.Vector3(-dir.z, 0, dir.x).multiplyScalar(unit);
+                        makeVoxel(p.x + side.x, yBase + Math.round(s*0.03/unit)*unit, p.z + side.z, woodMat);
+                    }
+                }
+                // Leaf cluster at branch tip (non-uniform small blob)
+                const tip = dir.clone().multiplyScalar(steps*unit);
+                const rLeaf = Math.round(0.3 / 0.1);
+                for (let iy = -rLeaf; iy <= rLeaf; iy++) {
+                    for (let ix = -rLeaf; ix <= rLeaf; ix++) {
+                        for (let iz = -rLeaf; iz <= rLeaf; iz++) {
+                            const ell = (ix*ix)/(rLeaf*rLeaf) + (iy*iy)/(rLeaf*rLeaf*0.7) + (iz*iz)/(rLeaf*rLeaf);
+                            if (ell <= 1.0 && Math.random() > 0.12) {
+                                makeVoxel(tip.x + ix*unit, yBase + iy*unit, tip.z + iz*unit, leafMat);
+                            }
+                        }
+                    }
+                }
+            }
+            // Canopy cap above trunk (irregular dome)
+            const crownR = Math.round(0.7 / 0.1);
+            const crownBaseY = trunkH * unit + 2 * unit;
+            for (let iy = 0; iy <= crownR; iy++) {
+                const layerR = crownR - iy + (Math.random()>0.6? -1:0);
+                for (let ix = -layerR; ix <= layerR; ix++) {
+                    for (let iz = -layerR; iz <= layerR; iz++) {
+                        if (ix*ix + iz*iz <= layerR*layerR && Math.random() > 0.1) {
+                            makeVoxel(ix*unit, crownBaseY + iy*unit, iz*unit, leafMat);
+                        }
+                    }
+                }
+            }
+
+            // Compute world placement at bottom-left of the image by raycasting NDC to ground plane
+            const raycaster = new THREE.Raycaster();
+            const ndc = new THREE.Vector2(-0.86, -0.9); // near bottom-left but not cropped
+            raycaster.setFromCamera(ndc, cam);
+            const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -bounds.min.y);
+            const pos = new THREE.Vector3();
+            raycaster.ray.intersectPlane(groundPlane, pos);
+            // Ensure not overlapping: if inside structure (with margin), push outward from center
+            const margin = 0.4;
+            const cx = (bounds.min.x + bounds.max.x) * 0.5;
+            const cz = (bounds.min.z + bounds.max.z) * 0.5;
+            const inside = (pos.x > bounds.min.x - margin && pos.x < bounds.max.x + margin && pos.z > bounds.min.z - margin && pos.z < bounds.max.z + margin);
+            if (inside) {
+                const pushDir = new THREE.Vector3(pos.x - cx, 0, pos.z - cz).normalize();
+                if (pushDir.lengthSq() < 1e-6) pushDir.set(-1,0,1).normalize();
+                pos.add(pushDir.multiplyScalar(margin + 0.6));
+            }
+            // Nudge inward from the extreme left edge to avoid cropping
+            {
+                const center = new THREE.Vector3().addVectors(bounds.min, bounds.max).multiplyScalar(0.5);
+                const camDir = center.clone().sub(cam.position).normalize();
+                const right = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0,1,0)).normalize();
+                pos.add(right.multiplyScalar(0.2));
+            }
+            // Snap exactly to ground and apply small epsilon to avoid z-fighting
+            pos.y = bounds.min.y + unit * 0.5;
+            treeGroup.position.copy(pos);
+            scene.add(treeGroup);
+            return treeGroup;
+        };
+        const tempTree = addVoxelTree(camIso);
+
         const isoColorUrl = renderToDataURL(camIso, size, size, { clearColor: 0xffffff });
-
-        const { nearZ, farZ } = computeDepthRangeForSet(structureVoxels, camIso);
-        const depthMaterial = createLinearDepthMaterial(nearZ, farZ, true, 1.0, 32);
-        const isoDepthUrl = renderToDataURL(camIso, size, size, { overrideMaterial: depthMaterial, clearColor: 0x000000 });
-        depthMaterial.dispose();
-
+        
         restore();
+        // Remove tree marker
+        if (typeof tempTree !== 'undefined' && tempTree) {
+            tempTree.traverse(n=>{ if(n.isMesh){ n.geometry?.dispose?.(); n.material?.dispose?.(); } });
+            scene.remove(tempTree);
+        }
 
-        // Add captured images to gallery (don't clear existing)
+        // Store the captured image for Send to Flux
+        latestCapturedImageUrl = isoColorUrl;
+        
+        // Update preview in buildify menu
+        updateCapturePreview(isoColorUrl);
+        
+        // Add captured image to gallery (don't clear existing)
         displayCapturedImages([
-            { label: 'ISOMETRIC COLOR', dataUrl: isoColorUrl },
-            { label: 'ISOMETRIC DEPTH', dataUrl: isoDepthUrl }
+            { label: 'ISOMETRIC COLOR', dataUrl: isoColorUrl }
         ]);
-        showToast('Captured structure views', 'success');
+        showToast('Structure captured', 'success');
     } catch (e) {
         console.error('Capture failed:', e);
         showToast('Capture failed', 'error');
@@ -958,6 +1078,34 @@ function displayCapturedImages(images) {
     persistStateIfEnabled();
 }
 
+function updateCapturePreview(imageUrl) {
+    const previewPlaceholder = document.getElementById('capturePreviewPlaceholder');
+    const previewImage = document.getElementById('capturePreviewImage');
+    const captureBtn = document.getElementById('captureStructureBtn');
+    
+    if (previewPlaceholder) previewPlaceholder.style.display = 'none';
+    if (previewImage) {
+        previewImage.src = imageUrl;
+        previewImage.style.display = 'block';
+    }
+    if (captureBtn) {
+        captureBtn.textContent = 'Recapture Structure';
+    }
+}
+
+function resetCapturePreview() {
+    const previewPlaceholder = document.getElementById('capturePreviewPlaceholder');
+    const previewImage = document.getElementById('capturePreviewImage');
+    const captureBtn = document.getElementById('captureStructureBtn');
+    
+    if (previewPlaceholder) previewPlaceholder.style.display = 'block';
+    if (previewImage) previewImage.style.display = 'none';
+    if (captureBtn) {
+        captureBtn.textContent = 'Capture Structure';
+    }
+    latestCapturedImageUrl = null;
+}
+
 function saveCurrentGalleryState() {
     if (!focusedStructure) return;
     const gallery = document.getElementById('captureGallery');
@@ -965,6 +1113,33 @@ function saveCurrentGalleryState() {
     
     // Save current gallery HTML for this structure
     structureGalleries.set(focusedStructure.id, gallery.innerHTML);
+}
+
+function saveGalleryStateForStructure(structureId) {
+    if (structureId == null) return;
+    
+    // If this is the currently focused structure, save from DOM
+    if (focusedStructure && focusedStructure.id === structureId) {
+        saveCurrentGalleryState();
+    }
+    // Otherwise, the gallery state should already be up to date in the Map
+}
+
+function addItemToStructureGallery(item, structureId) {
+    if (structureId == null) return;
+    
+    // Get current gallery HTML for this structure
+    const existingGalleryHtml = structureGalleries.get(structureId) || '';
+    
+    // Create a temporary container to manipulate the HTML
+    const tempDiv = document.createElement('div');
+    tempDiv.innerHTML = existingGalleryHtml;
+    
+    // Add the new item to the beginning
+    tempDiv.insertBefore(item.cloneNode(true), tempDiv.firstChild);
+    
+    // Save the updated HTML back to the Map
+    structureGalleries.set(structureId, tempDiv.innerHTML);
 }
 
 function loadGalleryForStructure(structureId) {
@@ -975,8 +1150,25 @@ function loadGalleryForStructure(structureId) {
     const savedGallery = structureGalleries.get(structureId);
     if (savedGallery !== undefined) {
         gallery.innerHTML = savedGallery;
+        // Check if this structure has a captured image
+        const hasColorCapture = savedGallery.includes('ISOMETRIC COLOR');
+        if (hasColorCapture) {
+            // Find the captured image and update preview
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(savedGallery, 'text/html');
+            const colorItem = [...doc.querySelectorAll('.capture-item')].find(item => 
+                item.dataset.label === 'ISOMETRIC COLOR'
+            );
+            if (colorItem && colorItem.dataset.src) {
+                updateCapturePreview(colorItem.dataset.src);
+                latestCapturedImageUrl = colorItem.dataset.src;
+            }
+        } else {
+            resetCapturePreview();
+        }
     } else {
         gallery.innerHTML = '';
+        resetCapturePreview();
     }
     
     // Re-attach event listeners for Tripo items
@@ -988,20 +1180,74 @@ function reattachGalleryEventListeners() {
     if (!gallery) return;
     
     gallery.querySelectorAll('.capture-item').forEach(item => {
+        const itemType = item.dataset.type;
+        const itemSrc = item.dataset.src;
+        const structureId = item.dataset.structureId;
+        
+        // Re-attach download button listeners
+        const downloadBtn = item.querySelector('.download-btn');
+        if (downloadBtn && itemSrc) {
+            downloadBtn.addEventListener('click', async () => {
+                if (itemType === 'tripo') {
+                    const glbUrl = item.dataset.glb;
+                    const fileName = makeFilename('tripo_model').replace(/\.png$/, '.glb');
+                    const a = document.createElement('a');
+                    a.href = glbUrl; a.download = fileName;
+                    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+                } else {
+                    const fileName = itemType === 'flux' ? 'flux_depth_result' : 'captured_image';
+                    downloadDataURL(itemSrc, makeFilename(fileName));
+                }
+            });
+        }
+        
+        // Re-attach Send to Tripo button listeners (for FLUX results)
+        const sendTripoBtn = item.querySelector('.send-tripo-btn');
+        if (sendTripoBtn && itemSrc) {
+            sendTripoBtn.addEventListener('click', async () => {
+                sendTripoBtn.disabled = true;
+                sendTripoBtn.textContent = 'Sending...';
+                try {
+                    showToast('Sending to Tripo…', 'info');
+                    await sendImageToTripo(itemSrc);
+                    sendTripoBtn.textContent = 'Sent';
+                    showToast('Sent to Tripo', 'success');
+                } catch (e) {
+                    console.error('Tripo send failed:', e);
+                    showToast('Tripo send failed', 'error');
+                    sendTripoBtn.textContent = 'SEND TO TRIPO';
+                    sendTripoBtn.disabled = false;
+                }
+            });
+        }
+        
+        // Re-attach stick skin button listeners
+        const stickSkinBtn = item.querySelector('.stick-skin');
+        if (stickSkinBtn && itemSrc) {
+            stickSkinBtn.addEventListener('click', async () => {
+                showToast('Preparing skin…', 'info');
+                await addSkinToFocusedStructure(itemSrc);
+            });
+        }
+        
         // Re-attach place/remove button listeners for Tripo items
         const placeBtn = item.querySelector('.place-remove-btn');
         if (placeBtn) {
             const glbUrl = item.dataset.glb;
-            const structureId = item.dataset.structureId;
             placeBtn.addEventListener('click', async (e) => {
                 const btn = e.target;
                 if (btn.dataset.action === 'place') {
-                    await enableTripoPlacement(glbUrl, structureId || (focusedStructure && focusedStructure.id));
+                    const useVisualization = document.getElementById('enablePlacementVisualization')?.checked;
+                    if (useVisualization) {
+                        await enableTripoPlacementWithVisualization(glbUrl, structureId || (focusedStructure && focusedStructure.id));
+                    } else {
+                        await enableTripoPlacement(glbUrl, structureId || (focusedStructure && focusedStructure.id));
+                    }
                     btn.textContent = 'Remove';
                     btn.dataset.action = 'remove';
                     btn.style.background = '#f44336';
                 } else {
-                    disableTripoPlacement();
+                    disableTripoPlacement(structureId || (focusedStructure && focusedStructure.id));
                     btn.textContent = 'Place in Scene';
                     btn.dataset.action = 'place';
                     btn.style.background = '#4CAF50';
@@ -1287,10 +1533,10 @@ function renderToDataURL(camera, width, height, { overrideMaterial = null, clear
 function isolateForCapture(structureVoxels) {
     const toRestore = [];
 
-    // Hide grid helpers/planes
+    // Hide flat grid helper/plane so only segmented ground appears in capture
     scene.children.forEach(child => {
-        const isGrid = child.userData && (child.userData.isGridHelper || child.userData.isGridPlane);
-        if (isGrid && child.visible) {
+        const isGridOverlay = child.userData && (child.userData.isGridHelper || child.userData.isGridPlane);
+        if (isGridOverlay && child.visible) {
             toRestore.push(child);
             child.visible = false;
         }
@@ -1309,9 +1555,14 @@ function isolateForCapture(structureVoxels) {
         }
     });
 
+    // No markers here; they will be added by the capture routine after camera is set
+    const markerNodes = [];
+
     return {
         restore() {
             toRestore.forEach(o => { o.visible = true; });
+            // Remove temporary markers
+            markerNodes.forEach(n => { scene.remove(n); n.geometry?.dispose?.(); });
         }
     };
 }
@@ -2033,6 +2284,51 @@ function updateStructuresMenu() {
     persistStateIfEnabled();
 }
 
+function transitionFocusModeToNewStructure(structure) {
+    console.log(`Transitioning focus mode from structure ${focusedStructure.id} to ${structure.id}`);
+    
+    // Detach transform controls from current model
+    detachTripoTransformControls();
+    
+    // Clear current active model references
+    tripoModelGroup = null;
+    tripoPlacementEnabled = false;
+    
+    // Update the focused structure voxels set with new structure voxels
+    focusedStructureVoxels.clear();
+    
+    // Find all voxels that belong to the new focused structure
+    structure.data.forEach(voxelData => {
+        const targetPos = new THREE.Vector3().fromArray(voxelData.position);
+        targetPos.x = Math.round(targetPos.x);
+        targetPos.y = Math.round(targetPos.y);
+        targetPos.z = Math.round(targetPos.z);
+        
+        const allObjects = [...groundGrid.flat(), ...voxels];
+        const matchingVoxel = allObjects.find(voxel => {
+            const voxelPos = voxel.position;
+            return Math.abs(voxelPos.x - targetPos.x) < 0.1 && 
+                   Math.abs(voxelPos.y - targetPos.y) < 0.1 && 
+                   Math.abs(voxelPos.z - targetPos.z) < 0.1;
+        });
+        
+        if (matchingVoxel) {
+            focusedStructureVoxels.add(matchingVoxel);
+        }
+    });
+    
+    // Update focus mode visibility for all voxels and models
+    updateFocusModeVisibility();
+    
+    // Check if the new structure has a model and activate it
+    const modelData = placedModelsByStructure.get(structure.id);
+    if (modelData && modelData.group) {
+        tripoModelGroup = modelData.group;
+        tripoPlacementEnabled = true;
+        attachTripoTransformControls(tripoModelGroup);
+    }
+}
+
 function loadStructure(structure) {
     // Save current gallery state before switching
     saveCurrentGalleryState();
@@ -2072,6 +2368,11 @@ function loadStructure(structure) {
     }
     // When loading a structure, apply its active skin if any
     applyActiveSkinForFocusedStructure();
+    
+    // If we're in focus mode, transition to the new structure's focus mode
+    if (focusMode) {
+        transitionFocusModeToNewStructure(structure);
+    }
 }
 
 function onWindowResize() {
@@ -2287,22 +2588,16 @@ async function sendIsometricToFalDepth() {
         return;
     }
 
-    const structureVoxels = collectVoxelsForStructure(focusedStructure);
-    if (structureVoxels.size === 0) {
-        alert('Could not find voxels for the active structure in the scene.');
+    // Capture the source structure ID at the start to prevent race conditions
+    const sourceStructureId = focusedStructure.id;
+
+    // Use the latest captured image instead of taking a new snapshot
+    if (!latestCapturedImageUrl) {
+        showToast('Please capture structure first', 'error');
         return;
     }
 
-    const bounds = computeBoundsForVoxelSet(structureVoxels);
-    const { restore } = isolateForCapture(structureVoxels);
-
-    const size = 768;
-    const cam = createOrthoObliqueCameraToFit(bounds, size, size, DEFAULT_ISO_ELEVATION_DEG, DEFAULT_ISO_AZIMUTH_DEG);
-    expandOrthoFrustum(cam, 1.06);
-    cam.updateMatrixWorld(true);
-    const colorUrl = renderToDataURL(cam, size, size, { clearColor: 0xffffff });
-
-    restore();
+    const colorUrl = latestCapturedImageUrl;
 
     const apiKey = (window.FAL_KEY || localStorage.getItem('FAL_KEY'));
     if (!apiKey) {
@@ -2333,20 +2628,20 @@ async function sendIsometricToFalDepth() {
 
     // Attempt 1: send data URL directly
     const firstAttempt = await callFalDepth(apiKey, prompt, colorUrl, p);
-    if (firstAttempt) { debugLog('send-flux:direct:ok', { url: firstAttempt }); attachFalResult(firstAttempt); return; }
+    if (firstAttempt) { debugLog('send-flux:direct:ok', { url: firstAttempt }); attachFalResult(firstAttempt, sourceStructureId); return; }
     debugLog('send-flux:direct:miss');
     const uploadedUrl = await uploadViaFalClient(colorUrl);
     if (uploadedUrl) {
         debugLog('send-flux:uploaded', { uploadedUrl });
         const secondAttempt = await callFalDepth(apiKey, prompt, uploadedUrl, p);
-        if (secondAttempt) { debugLog('send-flux:upload:ok', { url: secondAttempt }); attachFalResult(secondAttempt); return; }
+        if (secondAttempt) { debugLog('send-flux:upload:ok', { url: secondAttempt }); attachFalResult(secondAttempt, sourceStructureId); return; }
         debugLog('send-flux:upload:miss');
     }
     const imgurUrl = await uploadImageDataURL_viaImgurOnly(colorUrl);
     if (imgurUrl) {
         debugLog('send-flux:imgur', { imgurUrl });
         const thirdAttempt = await callFalDepth(apiKey, prompt, imgurUrl, p);
-        if (thirdAttempt) { debugLog('send-flux:imgur:ok', { url: thirdAttempt }); attachFalResult(thirdAttempt); return; }
+        if (thirdAttempt) { debugLog('send-flux:imgur:ok', { url: thirdAttempt }); attachFalResult(thirdAttempt, sourceStructureId); return; }
         debugLog('send-flux:imgur:miss');
     }
     window.open(colorUrl, '_blank');
@@ -2386,12 +2681,13 @@ async function callFalDepth(apiKey, prompt, controlImage, extraParams = {}) {
     }
 }
 
-function attachFalResult(imageUrl) {
+function attachFalResult(imageUrl, sourceStructureId = null) {
     const item = document.createElement('div');
     item.className = 'capture-item';
     item.dataset.type = 'flux';
     item.dataset.src = imageUrl;
-    if (focusedStructure && focusedStructure.id != null) item.dataset.structureId = String(focusedStructure.id);
+    const structureId = sourceStructureId || (focusedStructure && focusedStructure.id);
+    if (structureId != null) item.dataset.structureId = String(structureId);
     item.innerHTML = `
         <div class="capture-header">
             <div class="capture-label">FLUX DEPTH RESULT</div>
@@ -2427,9 +2723,23 @@ function attachFalResult(imageUrl) {
         showToast('Preparing skin…', 'info');
         await addSkinToFocusedStructure(imageUrl);
     });
-    const gallery = document.getElementById('captureGallery');
-    gallery && gallery.prepend(item);
-    saveCurrentGalleryState();
+    // Add to the correct structure's gallery
+    if (structureId != null) {
+        // If this is the currently focused structure, add to visible gallery and save state
+        if (focusedStructure && focusedStructure.id === structureId) {
+            const gallery = document.getElementById('captureGallery');
+            gallery && gallery.prepend(item);
+            saveCurrentGalleryState();
+        } else {
+            // Add to the structure's stored gallery HTML
+            addItemToStructureGallery(item, structureId);
+        }
+    } else {
+        // Fallback to current gallery if no structure ID
+        const gallery = document.getElementById('captureGallery');
+        gallery && gallery.prepend(item);
+        saveCurrentGalleryState();
+    }
     persistStateIfEnabled();
 }
 
@@ -2652,20 +2962,41 @@ function attachTripoResult(glbUrl, previewUrl, sourceStructureId = null) {
         a.href = glbUrl; a.download = fileName.replace(/\.png$/, '.glb');
         document.body.appendChild(a); a.click(); document.body.removeChild(a);
     });
-    gallery && gallery.prepend(item);
+    
+    // Add to the correct structure's gallery
+    const structureId = sourceStructureId || (focusedStructure && focusedStructure.id);
+    if (structureId != null) {
+        // If this is the currently focused structure, add to visible gallery and save state
+        if (focusedStructure && focusedStructure.id === structureId) {
+            gallery && gallery.prepend(item);
+            saveCurrentGalleryState();
+        } else {
+            // Add to the structure's stored gallery HTML
+            addItemToStructureGallery(item, structureId);
+        }
+    } else {
+        // Fallback to current gallery if no structure ID
+        gallery && gallery.prepend(item);
+        saveCurrentGalleryState();
+    }
+    
     const container = item.querySelector('.tripo-viewer');
     initTripoViewer(container, glbUrl);
-    saveCurrentGalleryState();
     const placeBtn = item.querySelector('.place-remove-btn');
     placeBtn.addEventListener('click', async (e) => {
         const btn = e.target;
         if (btn.dataset.action === 'place') {
-            await enableTripoPlacement(glbUrl, sourceStructureId || (focusedStructure && focusedStructure.id));
+            const useVisualization = document.getElementById('enablePlacementVisualization')?.checked;
+            if (useVisualization) {
+                await enableTripoPlacementWithVisualization(glbUrl, sourceStructureId || (focusedStructure && focusedStructure.id));
+            } else {
+                await enableTripoPlacement(glbUrl, sourceStructureId || (focusedStructure && focusedStructure.id));
+            }
             btn.textContent = 'Remove';
             btn.dataset.action = 'remove';
             btn.style.background = '#f44336';
         } else {
-            disableTripoPlacement();
+            disableTripoPlacement(sourceStructureId || (focusedStructure && focusedStructure.id));
             btn.textContent = 'Place in Scene';
             btn.dataset.action = 'place';
             btn.style.background = '#4CAF50';
@@ -2736,7 +3067,11 @@ async function initTripoViewer(container, glbUrl) {
 }
 
 async function enableTripoPlacement(glbUrl, structureId = null) {
-    if (tripoPlacementEnabled) return;
+    // Check if this specific structure already has a model
+    if (structureId && placedModelsByStructure.has(structureId)) {
+        console.log(`Structure ${structureId} already has a model placed`);
+        return;
+    }
     const gltfRoot = await loadGLTFRoot(glbUrl);
     cachedTripoGLB = gltfRoot;
     // Compute placement bounds: prefer focused structure; else selected; else all voxels; else origin box
@@ -2775,71 +3110,109 @@ async function enableTripoPlacement(glbUrl, structureId = null) {
     let modelBoxAtOrigin = new THREE.Box3().setFromObject(gltfRoot);
     let modelSizeAtOrigin = modelBoxAtOrigin.getSize(new THREE.Vector3());
     
-    // Fine-grained Y-axis rotation search to match structure dimensions
-    let bestRotation = 0;
-    let bestScore = Infinity;
-    
-    // Test rotations in 5-degree increments for full 360 degrees
-    const numSteps = 72; // 360 / 5
-    for (let i = 0; i < numSteps; i++) {
-        const rotation = (i * 5) * Math.PI / 180;
-        gltfRoot.rotation.y = rotation;
-        gltfRoot.updateMatrixWorld(true);
-        
-        const testBox = new THREE.Box3().setFromObject(gltfRoot);
-        const testSize = testBox.getSize(new THREE.Vector3());
-        
-        // Calculate how well the model dimensions match the structure
-        // We want the model's X dimension to match structure's X, and Z to match Z
-        const xDiff = Math.abs(testSize.x - (structureSize.x + 1));
-        const zDiff = Math.abs(testSize.z - (structureSize.z + 1));
-        
-        // Also check if swapping X and Z gives a better match
-        const xzSwapDiffX = Math.abs(testSize.z - (structureSize.x + 1));
-        const xzSwapDiffZ = Math.abs(testSize.x - (structureSize.z + 1));
-        
-        // Use the configuration with the smallest total difference
-        const directScore = xDiff + zDiff;
-        const swapScore = xzSwapDiffX + xzSwapDiffZ;
-        const score = Math.min(directScore, swapScore);
-        
-        if (score < bestScore) {
-            bestScore = score;
-            bestRotation = rotation;
-            modelSizeAtOrigin = testSize.clone();
-        }
-    }
-    
-    // Apply the best rotation found
-    gltfRoot.rotation.y = bestRotation;
-    gltfRoot.updateMatrixWorld(true);
-    modelBoxAtOrigin = new THREE.Box3().setFromObject(gltfRoot);
-    modelSizeAtOrigin = modelBoxAtOrigin.getSize(new THREE.Vector3());
-    
-    console.log(`Model rotated by ${(bestRotation * 180 / Math.PI).toFixed(1)}°`);
-    
-    // Calculate scale to match structure bounds
-    // Since voxels are 1x1x1 and positioned at integer coordinates,
-    // a structure from x=0 to x=2 actually spans 3 units (3 voxels)
-    const actualStructureSize = new THREE.Vector3(
-        structureSize.x + 1,  // Add 1 because bounds are inclusive
+    // Compute target size including inclusive bounds (+1)
+    const targetSize = new THREE.Vector3(
+        structureSize.x + 1,
         structureSize.y + 1,
         structureSize.z + 1
     );
-    
-    const scaleX = actualStructureSize.x / modelSizeAtOrigin.x;
-    const scaleY = actualStructureSize.y / modelSizeAtOrigin.y;
-    const scaleZ = actualStructureSize.z / modelSizeAtOrigin.z;
-    
-    // Use the median scale for better overall fit
-    const scales = [scaleX, scaleY, scaleZ].sort((a, b) => a - b);
-    let uniformScale = scales[1]; // median
-    
-    // Apply a scale correction factor since models appear 2/3 of correct size
-    uniformScale *= 1.5;
-    
-    gltfRoot.scale.setScalar(uniformScale);
-    gltfRoot.updateMatrixWorld(true);
+
+    // First try PCA-based upright orientation and footprint mapping
+    let appliedRotation = false;
+    const pca = computePCAAxesAndExtents(gltfRoot);
+    if (pca && pca.axes && pca.sizes) {
+        const axes = pca.axes; // three orthonormal directions in world space
+        const sizes = pca.sizes; // extents along these axes
+        // Choose the axis with the largest size to map to +Y (upright)
+        const idxY = (sizes.y >= sizes.x && sizes.y >= sizes.z) ? 1 : (sizes.x >= sizes.z ? 0 : 2);
+        // Remaining indices for footprint mapping
+        const rem = [0,1,2].filter(i => i !== idxY);
+        const idxA = rem[0], idxB = rem[1];
+        const candidates = [];
+        const makeCandidate = (idxX, signX) => {
+            // Up axis ey should point upwards
+            const eyBase = axes[idxY].clone();
+            const ey = (eyBase.y < 0 ? eyBase.clone().negate() : eyBase.clone());
+            const exBase = axes[idxX].clone().multiplyScalar(signX);
+            // ez forms right-handed basis
+            let ez = new THREE.Vector3().crossVectors(exBase, ey).normalize();
+            // If degenerate due to near-colinearity, skip
+            if (ez.lengthSq() < 0.9) return;
+            const ex = exBase.clone().normalize();
+            // Determine which pca size maps to ex/ez for footprint
+            const sizeX = sizes.getComponent(idxX);
+            const idxZ = [0,1,2].find(i => i !== idxY && i !== idxX);
+            const sizeZ = sizes.getComponent(idxZ);
+            // Solve LS uniform scale for footprint
+            const tx = targetSize.x, tz = targetSize.z;
+            const mx = Math.max(1e-6, sizeX), mz = Math.max(1e-6, sizeZ);
+            const denom = mx*mx + mz*mz;
+            const s = denom > 1e-9 ? (tx*mx + tz*mz) / denom : 1;
+            const rx = s*mx - tx; const rz = s*mz - tz;
+            const cost = rx*rx + rz*rz;
+            // Prefer ex to point generally towards +X to reduce unnecessary 180° flips when tied
+            const tieBias = 1 - Math.max(0, ex.dot(new THREE.Vector3(1,0,0))); // 0 if aligned with +X
+            candidates.push({ ex, ey, ez, s, cost: cost + 1e-3 * tieBias });
+        };
+        // Two permutations for footprint axis to X (A->X or B->X), try both signs for ex
+        makeCandidate(idxA, +1); makeCandidate(idxA, -1);
+        makeCandidate(idxB, +1); makeCandidate(idxB, -1);
+        if (candidates.length > 0) {
+            candidates.sort((a,b) => a.cost - b.cost);
+            const best = candidates[0];
+            // Build basis from chosen ex,ey,ez and compute rotation R = D * S^T (with D=identity)
+            const S = new THREE.Matrix4().makeBasis(best.ex, best.ey, best.ez);
+            const R = new THREE.Matrix4().copy(S).transpose();
+            gltfRoot.setRotationFromMatrix(R);
+            gltfRoot.updateMatrixWorld(true);
+            // After rotation, recompute actual box dimensions
+            const rotatedBox = new THREE.Box3().setFromObject(gltfRoot);
+            const rotatedSize = rotatedBox.getSize(new THREE.Vector3());
+            // Weighted least-squares uniform scale including height (favor footprint)
+            const wX = 4, wZ = 4, wY = 1;
+            const mx = Math.max(1e-6, rotatedSize.x);
+            const my = Math.max(1e-6, rotatedSize.y);
+            const mz = Math.max(1e-6, rotatedSize.z);
+            const tx = targetSize.x, ty = targetSize.y, tz = targetSize.z;
+            const denom = wX*mx*mx + wY*my*my + wZ*mz*mz;
+            const s = denom > 1e-9 ? (wX*tx*mx + wY*ty*my + wZ*tz*mz) / denom : 1;
+            gltfRoot.scale.setScalar(s);
+            gltfRoot.updateMatrixWorld(true);
+            appliedRotation = true;
+        }
+    }
+
+    // Fallback: search yaw-only cardinal rotations with LS footprint scale
+    if (!appliedRotation) {
+        const yawCandidates = [0, 90, 180, 270];
+        let bestYawRad = 0;
+        let bestScale = 1;
+        let bestCost = Infinity;
+        const tx = targetSize.x, tz = targetSize.z;
+        for (const deg of yawCandidates) {
+            const rad = deg * Math.PI / 180;
+            gltfRoot.rotation.set(0, rad, 0);
+            gltfRoot.updateMatrixWorld(true);
+            const testBox = new THREE.Box3().setFromObject(gltfRoot);
+            const testSize = testBox.getSize(new THREE.Vector3());
+            const mx = Math.max(1e-6, testSize.x);
+            const mz = Math.max(1e-6, testSize.z);
+            const denom = mx*mx + mz*mz;
+            const s = denom > 1e-9 ? (tx*mx + tz*mz) / denom : 1;
+            const rx = s*mx - tx;
+            const rz = s*mz - tz;
+            const cost = rx*rx + rz*rz;
+            const preferNoRotation = (Math.abs(cost - bestCost) < 0.01*(tx+tz) && deg === 0);
+            if (cost < bestCost || preferNoRotation) {
+                bestCost = cost;
+                bestYawRad = rad;
+                bestScale = s;
+            }
+        }
+        gltfRoot.rotation.set(0, bestYawRad, 0);
+        gltfRoot.scale.setScalar(bestScale);
+        gltfRoot.updateMatrixWorld(true);
+    }
 
     // Get the final bounding box after scaling
     const scaledBox = new THREE.Box3().setFromObject(gltfRoot);
@@ -2856,17 +3229,37 @@ async function enableTripoPlacement(glbUrl, structureId = null) {
     
     gltfRoot.position.copy(finalPosition);
     
-    console.log(`Model scaled by ${uniformScale.toFixed(2)}x and positioned at (${gltfRoot.position.x.toFixed(1)}, ${gltfRoot.position.y.toFixed(1)}, ${gltfRoot.position.z.toFixed(1)})`);
+    // Log summary
+    const yawDeg = (gltfRoot.rotation.y * 180 / Math.PI).toFixed(0);
+    const scaleApplied = gltfRoot.scale.x.toFixed(3);
+    console.log(`Placement -> yaw ${yawDeg}°, scale ${scaleApplied}, position (${gltfRoot.position.x.toFixed(1)}, ${gltfRoot.position.y.toFixed(1)}, ${gltfRoot.position.z.toFixed(1)})`);
 
-    tripoModelGroup = new THREE.Group();
-    tripoModelGroup.userData.isTripoModel = true;
-    tripoModelGroup.add(gltfRoot);
-    scene.add(tripoModelGroup);
-    // Don't automatically hide the structure - let user control visibility
-    tripoPlacementEnabled = true;
-    // Only show transform controls in focus mode
+    const modelGroup = new THREE.Group();
+    modelGroup.userData.isTripoModel = true;
+    modelGroup.userData.structureId = structureId;
+    modelGroup.add(gltfRoot);
+    scene.add(modelGroup);
+    
+    // Store the model in the tracking map
+    placedModelsByStructure.set(structureId, {
+        group: modelGroup,
+        glbUrl: glbUrl
+    });
+    
+    // Set as active model if this is for the focused structure
+    if (focusedStructure && structureId === focusedStructure.id) {
+        tripoModelGroup = modelGroup;
+        tripoPlacementEnabled = true;
+        
+        // Show transform controls in focus mode
+        if (focusMode) {
+            await attachTripoTransformControls(tripoModelGroup);
+        }
+    }
+    
+    // Update focus mode visibility if active
     if (focusMode) {
-        await attachTripoTransformControls(tripoModelGroup);
+        updateFocusModeVisibility();
     }
 }
 
@@ -2932,24 +3325,50 @@ function generateAxisAlignedRotations() {
     return mats;
 }
 
-function disableTripoPlacement() {
-    if (!tripoPlacementEnabled) return;
-    if (tripoModelGroup) {
-        scene.remove(tripoModelGroup);
-        tripoModelGroup.traverse(obj => {
-            if (obj.isMesh) {
-                if (obj.geometry) obj.geometry.dispose();
-                if (obj.material) {
-                    if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
-                    else obj.material.dispose();
+function disableTripoPlacement(structureId = null) {
+    // If structureId is provided, only remove that specific model
+    if (structureId) {
+        const modelData = placedModelsByStructure.get(structureId);
+        if (modelData && modelData.group) {
+            scene.remove(modelData.group);
+            modelData.group.traverse(obj => {
+                if (obj.isMesh) {
+                    if (obj.geometry) obj.geometry.dispose();
+                    if (obj.material) {
+                        if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
+                        else obj.material.dispose();
+                    }
                 }
+            });
+            placedModelsByStructure.delete(structureId);
+            
+            // If this was the active model, clear it and detach controls
+            if (tripoModelGroup === modelData.group) {
+                tripoModelGroup = null;
+                detachTripoTransformControls();
+                tripoPlacementEnabled = false;
             }
-        });
-        tripoModelGroup = null;
+        }
+    } else {
+        // Remove all models (legacy behavior)
+        if (!tripoPlacementEnabled) return;
+        if (tripoModelGroup) {
+            scene.remove(tripoModelGroup);
+            tripoModelGroup.traverse(obj => {
+                if (obj.isMesh) {
+                    if (obj.geometry) obj.geometry.dispose();
+                    if (obj.material) {
+                        if (Array.isArray(obj.material)) obj.material.forEach(m => m.dispose());
+                        else obj.material.dispose();
+                    }
+                }
+            });
+            tripoModelGroup = null;
+        }
+        detachTripoTransformControls();
+        if (focusMode) restoreOriginalFocusedStructure();
+        tripoPlacementEnabled = false;
     }
-    detachTripoTransformControls();
-    if (focusMode) restoreOriginalFocusedStructure();
-    tripoPlacementEnabled = false;
 }
 
 async function loadGLTFRoot(glbUrl) {
@@ -3097,13 +3516,37 @@ async function attachTripoTransformControls(target) {
     let lastRotation = { x: 0, y: 0, z: 0 };
     let lastScale = 1;
     
+    // Store initial values
+    if (target) {
+        lastRotation = {
+            x: target.rotation.x * 180 / Math.PI,
+            y: target.rotation.y * 180 / Math.PI,
+            z: target.rotation.z * 180 / Math.PI
+        };
+        lastScale = target.scale.x;
+    }
+    
+    // Enforce uniform scale when in scale mode
+    let initialScale = target ? target.scale.x : 1;
+    let isDraggingScale = false;
+    
     tripoTransformControls.addEventListener('dragging-changed', (e) => {
         isDraggingGizmo = e.value;
+        const mode = typeof tripoTransformControls.getMode === 'function' ? tripoTransformControls.getMode() : tripoTransformControls.mode;
+        
+        if (mode === 'scale') {
+            if (e.value) {
+                // Starting to drag - store initial scale
+                initialScale = target ? target.scale.x : 1;
+                isDraggingScale = true;
+            } else {
+                // Finished dragging
+                isDraggingScale = false;
+            }
+        }
         
         // Log changes when dragging ends
         if (!e.value && target) {
-            const mode = typeof tripoTransformControls.getMode === 'function' ? tripoTransformControls.getMode() : tripoTransformControls.mode;
-            
             if (mode === 'rotate') {
                 const currentRotation = {
                     x: target.rotation.x * 180 / Math.PI,
@@ -3132,21 +3575,9 @@ async function attachTripoTransformControls(target) {
         }
     });
     
-    // Store initial values
-    if (target) {
-        lastRotation = {
-            x: target.rotation.x * 180 / Math.PI,
-            y: target.rotation.y * 180 / Math.PI,
-            z: target.rotation.z * 180 / Math.PI
-        };
-        lastScale = target.scale.x;
-    }
-    
-    // Enforce uniform scale when in scale mode
-    let initialScale = target ? target.scale.x : 1;
     tripoTransformControls.addEventListener('objectChange', () => {
         const mode = typeof tripoTransformControls.getMode === 'function' ? tripoTransformControls.getMode() : tripoTransformControls.mode;
-        if (mode === 'scale' && target) {
+        if (mode === 'scale' && target && isDraggingScale) {
             const s = target.scale;
             // Find which axis changed the most from the initial scale
             const deltaX = Math.abs(s.x - initialScale);
@@ -3163,7 +3594,6 @@ async function attachTripoTransformControls(target) {
             }
             
             target.scale.setScalar(factor);
-            initialScale = factor;
         }
     });
     tripoTransformControls.attach(target);
@@ -3193,15 +3623,6 @@ function detachTripoTransformControls() {
     if (hud) hud.style.display = 'none';
 }
 
-async function resolveSampleGlbUrl() {
-    if (location.protocol === 'file:') return null;
-    const base = location.origin;
-    const candidates = [`${base}/glbFiles/example1.glb`, './glbFiles/example1.glb', 'glbFiles/example1.glb'];
-    for (const u of candidates) {
-        try { const r = await fetch(u, { method: 'HEAD' }); if (r.ok) return u; } catch {}
-    }
-    return null;
-}
 
 function resolveThreeSemver() {
     const rev = (THREE && THREE.REVISION) ? String(THREE.REVISION).trim() : '';
@@ -3785,9 +4206,10 @@ function chooseBestMappingUsingPCA(axes, sizes, targetSize) {
 
 function chooseBestAxisAlignedRotation(modelSize, targetSize) {
     const rotations = generateAxisAlignedRotations();
-    let best = { err: Infinity, matrix: new THREE.Matrix4(), rotatedSize: modelSize.clone(), scale: 1 };
-    const wX = 4, wZ = 4, wY = 1;
+    const longestAxisIndex = (modelSize.y >= modelSize.x && modelSize.y >= modelSize.z) ? 1 : (modelSize.x >= modelSize.z ? 0 : 2);
+    let best = { err: Infinity, matrix: new THREE.Matrix4(), rotatedSize: modelSize.clone() };
     rotations.forEach(m => {
+        // rotated size under axis-aligned rotation = permutation of size
         const axes = [
             new THREE.Vector3().setFromMatrixColumn(m, 0),
             new THREE.Vector3().setFromMatrixColumn(m, 1),
@@ -3919,13 +4341,24 @@ function persistStateIfEnabled() {
 }
 
 function snapshotPersistentState() {
-    // saved structures + skins + active indices + gallery items
+    // saved structures + skins + active indices + gallery items + structure galleries + placed models
     const structures = savedStructures.map(s => ({ id: s.id, name: s.name, data: s.data, thumbnail: s.thumbnail }));
     const skins = {};
     structureIdToSkinUrls.forEach((arr, id) => { skins[id] = Array.from(arr); });
     const skinIdx = {}; activeSkinIndex.forEach((idx, id) => { skinIdx[id] = idx; });
     const gallery = snapshotGalleryState();
-    return { structures, skins, skinIdx, gallery };
+    
+    // Save structure-specific galleries
+    const structureGalleryData = {};
+    structureGalleries.forEach((html, structureId) => { structureGalleryData[structureId] = html; });
+    
+    // Save placed models data (just the glbUrl and structureId, not the actual THREE.js objects)
+    const placedModelsData = {};
+    placedModelsByStructure.forEach((modelData, structureId) => {
+        placedModelsData[structureId] = { glbUrl: modelData.glbUrl };
+    });
+    
+    return { structures, skins, skinIdx, gallery, structureGalleryData, placedModelsData };
 }
 
 function snapshotGalleryState() {
@@ -3961,7 +4394,30 @@ function restorePersistentState() {
         // Rebuild scene voxels from saved structures
         rebuildSceneFromSavedStructures();
         updateStructuresMenu();
-        // Restore gallery
+        // Restore structure-specific galleries
+        if (state.structureGalleryData) {
+            structureGalleries = new Map();
+            Object.keys(state.structureGalleryData).forEach(structureId => {
+                structureGalleries.set(Number(structureId), state.structureGalleryData[structureId]);
+            });
+        }
+        
+        // Restore placed models (need to recreate the THREE.js objects)
+        if (state.placedModelsData) {
+            placedModelsByStructure = new Map();
+            // Process models asynchronously without blocking the main restoration
+            Object.keys(state.placedModelsData).forEach((structureId) => {
+                const modelData = state.placedModelsData[structureId];
+                if (modelData && modelData.glbUrl) {
+                    // Re-place the model for this structure (async but don't block)
+                    enableTripoPlacement(modelData.glbUrl, Number(structureId)).catch(e => {
+                        console.warn(`Failed to restore model for structure ${structureId}:`, e);
+                    });
+                }
+            });
+        }
+        
+        // Restore legacy gallery (for backward compatibility)
         if (Array.isArray(state.gallery)) {
             const gallery = document.getElementById('captureGallery');
             if (gallery) gallery.innerHTML = '';
@@ -4070,4 +4526,502 @@ function deleteStructureById(structureId) {
     updateStructuresMenu();
     persistStateIfEnabled();
     showToast('Structure deleted', 'success');
+}
+
+// Step-by-step placement visualization system
+class PlacementVisualizer {
+    constructor() {
+        this.steps = [];
+        this.currentStepIndex = 0;
+        this.visualizer = document.getElementById('placementVisualizer');
+        this.stepTitle = document.getElementById('stepTitle');
+        this.stepDescription = document.getElementById('stepDescription');
+        this.stepValues = document.getElementById('stepValues');
+        this.currentStepSpan = document.getElementById('currentStep');
+        this.totalStepsSpan = document.getElementById('totalSteps');
+        this.prevBtn = document.getElementById('prevStepBtn');
+        this.nextBtn = document.getElementById('nextStepBtn');
+        this.closeBtn = this.visualizer.querySelector('.close-visualizer');
+        
+        this.bindEvents();
+    }
+    
+    bindEvents() {
+        this.prevBtn.addEventListener('click', () => this.previousStep());
+        this.nextBtn.addEventListener('click', () => this.nextStep());
+        this.closeBtn.addEventListener('click', () => this.hide());
+        
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (this.visualizer.style.display === 'none') return;
+            if (e.key === 'ArrowLeft') this.previousStep();
+            else if (e.key === 'ArrowRight') this.nextStep();
+            else if (e.key === 'Escape') this.hide();
+        });
+    }
+    
+    show(steps) {
+        this.steps = steps;
+        this.currentStepIndex = 0;
+        this.visualizer.style.display = 'block';
+        this.totalStepsSpan.textContent = steps.length;
+        this.updateDisplay();
+    }
+    
+    hide() {
+        this.visualizer.style.display = 'none';
+        this.clearVisualIndicators();
+    }
+    
+    nextStep() {
+        if (this.currentStepIndex < this.steps.length - 1) {
+            this.currentStepIndex++;
+            this.updateDisplay();
+        }
+    }
+    
+    previousStep() {
+        if (this.currentStepIndex > 0) {
+            this.currentStepIndex--;
+            this.updateDisplay();
+        }
+    }
+    
+    updateDisplay() {
+        const step = this.steps[this.currentStepIndex];
+        
+        this.stepTitle.textContent = step.title;
+        this.stepDescription.textContent = step.description;
+        this.stepValues.textContent = step.values || 'No values to display';
+        this.currentStepSpan.textContent = this.currentStepIndex + 1;
+        
+        this.prevBtn.disabled = this.currentStepIndex === 0;
+        this.nextBtn.disabled = this.currentStepIndex === this.steps.length - 1;
+        
+        // Clear previous visual indicators and apply new ones
+        this.clearVisualIndicators();
+        if (step.visualCallback) {
+            step.visualCallback();
+        }
+    }
+    
+    clearVisualIndicators() {
+        document.querySelectorAll('.placement-indicator').forEach(el => el.remove());
+    }
+    
+    // Helper method to create visual indicators in the 3D scene
+    addVisualIndicator(type, position, label, color = 0xff4444) {
+        const indicator = document.createElement('div');
+        indicator.className = `placement-indicator placement-${type}`;
+        
+        if (type === 'box') {
+            indicator.style.position = 'absolute';
+            indicator.style.border = `2px solid #${color.toString(16).padStart(6, '0')}`;
+            indicator.style.background = `rgba(${(color >> 16) & 255}, ${(color >> 8) & 255}, ${color & 255}, 0.1)`;
+            indicator.style.pointerEvents = 'none';
+        } else if (type === 'arrow') {
+            indicator.className += ' placement-arrow';
+        }
+        
+        if (label) {
+            const labelEl = document.createElement('div');
+            labelEl.className = 'placement-label';
+            labelEl.textContent = label;
+            indicator.appendChild(labelEl);
+        }
+        
+        document.body.appendChild(indicator);
+        return indicator;
+    }
+}
+
+// Global instance
+const placementVisualizer = new PlacementVisualizer();
+
+// Interactive step-by-step placement function
+async function enableTripoPlacementWithVisualization(glbUrl, structureId = null) {
+    // Check if this specific structure already has a model
+    if (structureId && placedModelsByStructure.has(structureId)) {
+        alert('This structure already has a 3D model placed. Remove the existing model first.');
+        return;
+    }
+    
+    // Create the interactive placement controller
+    const controller = new InteractivePlacementController(glbUrl, structureId);
+    await controller.initialize();
+    controller.show();
+}
+
+// Interactive placement controller that performs each step when navigating
+class InteractivePlacementController {
+    constructor(glbUrl, structureId) {
+        this.glbUrl = glbUrl;
+        this.structureId = structureId;
+        this.currentStep = 0;
+        this.gltfRoot = null;
+        this.modelGroup = null;
+        this.bounds = null;
+        this.structureSize = null;
+        this.targetCenter = null;
+        this.modelBox = null;
+        this.modelSize = null;
+        this.modelCenter = null;
+        this.rotationTestData = [];
+        this.bestRotation = 0;
+        this.bestScore = Infinity;
+        this.uniformScale = 1;
+        
+        // Get UI elements
+        this.visualizer = document.getElementById('placementVisualizer');
+        this.stepTitle = document.getElementById('stepTitle');
+        this.stepDescription = document.getElementById('stepDescription');
+        this.stepValues = document.getElementById('stepValues');
+        this.currentStepSpan = document.getElementById('currentStep');
+        this.totalStepsSpan = document.getElementById('totalSteps');
+        this.prevBtn = document.getElementById('prevStepBtn');
+        this.nextBtn = document.getElementById('nextStepBtn');
+        this.closeBtn = this.visualizer.querySelector('.close-visualizer');
+        
+        this.bindEvents();
+        this.totalStepsSpan.textContent = '11';
+    }
+    
+    bindEvents() {
+        this.prevBtn.addEventListener('click', () => this.previousStep());
+        this.nextBtn.addEventListener('click', () => this.nextStep());
+        this.closeBtn.addEventListener('click', () => this.close());
+        
+        // Keyboard navigation
+        this.keyHandler = (e) => {
+            if (this.visualizer.style.display === 'none') return;
+            if (e.key === 'ArrowLeft') this.previousStep();
+            else if (e.key === 'ArrowRight') this.nextStep();
+            else if (e.key === 'Escape') this.close();
+        };
+        document.addEventListener('keydown', this.keyHandler);
+    }
+    
+    async initialize() {
+        // Pre-load the model and compute initial data
+        this.gltfRoot = await loadGLTFRoot(this.glbUrl);
+        this.bounds = this.structureId ? computeStructureBoundsById(this.structureId) : computePlacementBounds();
+        this.structureSize = new THREE.Vector3(
+            this.bounds.max.x - this.bounds.min.x,
+            this.bounds.max.y - this.bounds.min.y,
+            this.bounds.max.z - this.bounds.min.z
+        );
+        this.targetCenter = new THREE.Vector3().addVectors(this.bounds.min, this.bounds.max).multiplyScalar(0.5);
+    }
+    
+    show() {
+        this.visualizer.style.display = 'block';
+        this.executeStep(0);
+    }
+    
+    close() {
+        this.visualizer.style.display = 'none';
+        document.removeEventListener('keydown', this.keyHandler);
+        
+        // Clean up any incomplete placement
+        if (this.modelGroup && this.currentStep < 10) {
+            scene.remove(this.modelGroup);
+        }
+    }
+    
+    nextStep() {
+        if (this.currentStep < 10) {
+            this.currentStep++;
+            this.executeStep(this.currentStep);
+        }
+    }
+    
+    previousStep() {
+        if (this.currentStep > 0) {
+            this.currentStep--;
+            this.executeStep(this.currentStep);
+        }
+    }
+    
+    executeStep(stepIndex) {
+        this.currentStepSpan.textContent = stepIndex + 1;
+        this.prevBtn.disabled = stepIndex === 0;
+        this.nextBtn.disabled = stepIndex === 10;
+        
+        switch (stepIndex) {
+            case 0: this.step1_LoadModel(); break;
+            case 1: this.step2_AnalyzeStructure(); break;
+            case 2: this.step3_ResetTransforms(); break;
+            case 3: this.step4_MeasureModel(); break;
+            case 4: this.step5_CenterAtOrigin(); break;
+            case 5: this.step6_CalculateScale(); break;
+            case 6: this.step7_ApplyScale(); break;
+            case 7: this.step8_FindOptimalRotation(); break;
+            case 8: this.step9_ApplyRotation(); break;
+            case 9: this.step10_FinalPosition(); break;
+            case 10: this.step11_Complete(); break;
+        }
+    }
+    
+    step1_LoadModel() {
+        this.stepTitle.textContent = "Step 1: Loading 3D Model";
+        this.stepDescription.textContent = "Loading the GLB model file and preparing it for placement analysis.";
+        this.stepValues.textContent = `Model URL: ${this.glbUrl}\nStructure ID: ${this.structureId || 'Current focused/selected'}\nModel loaded: ✓`;
+    }
+    
+    step2_AnalyzeStructure() {
+        this.stepTitle.textContent = "Step 2: Analyze Target Structure";
+        this.stepDescription.textContent = "Computing the bounding box and dimensions of the target structure where the model will be placed.";
+        this.stepValues.textContent = `Structure bounds:
+Min: (${this.bounds.min.x.toFixed(1)}, ${this.bounds.min.y.toFixed(1)}, ${this.bounds.min.z.toFixed(1)})
+Max: (${this.bounds.max.x.toFixed(1)}, ${this.bounds.max.y.toFixed(1)}, ${this.bounds.max.z.toFixed(1)})
+Size: ${this.structureSize.x.toFixed(1)} × ${this.structureSize.y.toFixed(1)} × ${this.structureSize.z.toFixed(1)}
+Center: (${this.targetCenter.x.toFixed(1)}, ${this.targetCenter.y.toFixed(1)}, ${this.targetCenter.z.toFixed(1)})`;
+    }
+    
+    step3_ResetTransforms() {
+        // Actually reset the transforms
+        this.gltfRoot.rotation.set(0, 0, 0);
+        this.gltfRoot.scale.set(1, 1, 1);
+        this.gltfRoot.position.set(0, 0, 0);
+        this.gltfRoot.updateMatrixWorld(true);
+        
+        // Add to scene temporarily to show it
+        if (!this.modelGroup) {
+            this.modelGroup = new THREE.Group();
+            this.modelGroup.userData.isTripoModel = true;
+            this.modelGroup.userData.structureId = this.structureId;
+            this.modelGroup.add(this.gltfRoot);
+            scene.add(this.modelGroup);
+        }
+        
+        this.stepTitle.textContent = "Step 3: Reset Model Transforms";
+        this.stepDescription.textContent = "Resetting the model to its original position, rotation, and scale for baseline measurements. Model is now visible in scene.";
+        this.stepValues.textContent = `Position: (0, 0, 0)
+Rotation: (0°, 0°, 0°)
+Scale: (1, 1, 1)
+Model added to scene: ✓`;
+    }
+    
+    step4_MeasureModel() {
+        this.modelBox = new THREE.Box3().setFromObject(this.gltfRoot);
+        this.modelSize = this.modelBox.getSize(new THREE.Vector3());
+        this.modelCenter = this.modelBox.getCenter(new THREE.Vector3());
+        
+        this.stepTitle.textContent = "Step 4: Measure Original Model";
+        this.stepDescription.textContent = "Computing the model's original bounding box and dimensions before any transformations.";
+        this.stepValues.textContent = `Model bounds:
+Min: (${this.modelBox.min.x.toFixed(2)}, ${this.modelBox.min.y.toFixed(2)}, ${this.modelBox.min.z.toFixed(2)})
+Max: (${this.modelBox.max.x.toFixed(2)}, ${this.modelBox.max.y.toFixed(2)}, ${this.modelBox.max.z.toFixed(2)})
+Size: ${this.modelSize.x.toFixed(2)} × ${this.modelSize.y.toFixed(2)} × ${this.modelSize.z.toFixed(2)}
+Center: (${this.modelCenter.x.toFixed(2)}, ${this.modelCenter.y.toFixed(2)}, ${this.modelCenter.z.toFixed(2)})`;
+    }
+    
+    step5_CenterAtOrigin() {
+        // Actually center the model
+        this.gltfRoot.position.sub(this.modelCenter);
+        this.gltfRoot.updateMatrixWorld(true);
+        
+        const modelBoxAtOrigin = new THREE.Box3().setFromObject(this.gltfRoot);
+        const modelSizeAtOrigin = modelBoxAtOrigin.getSize(new THREE.Vector3());
+        
+        this.stepTitle.textContent = "Step 5: Center Model at Origin";
+        this.stepDescription.textContent = "Moving the model so its center is at the world origin (0,0,0) for stable transformations. Watch the model move!";
+        this.stepValues.textContent = `Offset applied: (${(-this.modelCenter.x).toFixed(2)}, ${(-this.modelCenter.y).toFixed(2)}, ${(-this.modelCenter.z).toFixed(2)})
+New position: (${this.gltfRoot.position.x.toFixed(2)}, ${this.gltfRoot.position.y.toFixed(2)}, ${this.gltfRoot.position.z.toFixed(2)})
+Size at origin: ${modelSizeAtOrigin.x.toFixed(2)} × ${modelSizeAtOrigin.y.toFixed(2)} × ${modelSizeAtOrigin.z.toFixed(2)}`;
+    }
+    
+    step8_FindOptimalRotation() {
+        // Get the current scaled model dimensions
+        const currentBox = new THREE.Box3().setFromObject(this.gltfRoot);
+        const currentSize = currentBox.getSize(new THREE.Vector3());
+        
+        // Target structure dimensions
+        const targetX = this.structureSize.x + 1;
+        const targetZ = this.structureSize.z + 1;
+        
+        // Test only the 4 cardinal directions: 0°, 90°, 180°, 270°
+        // This avoids weird in-between rotations and focuses on logical orientations
+        const testRotations = [0, 90, 180, 270];
+        this.bestRotation = 0;
+        this.bestScore = Infinity;
+        let bestRotationDegrees = 0;
+        
+        let rotationResults = [];
+        
+        for (const degrees of testRotations) {
+            const rotation = degrees * Math.PI / 180;
+            this.gltfRoot.rotation.y = rotation;
+            this.gltfRoot.updateMatrixWorld(true);
+            
+            const testBox = new THREE.Box3().setFromObject(this.gltfRoot);
+            const testSize = testBox.getSize(new THREE.Vector3());
+            
+            // Calculate how well this rotation matches the target dimensions
+            const xError = Math.abs(testSize.x - targetX);
+            const zError = Math.abs(testSize.z - targetZ);
+            const totalError = xError + zError;
+            
+            rotationResults.push({
+                degrees: degrees,
+                rotation: rotation,
+                error: totalError,
+                modelX: testSize.x,
+                modelZ: testSize.z,
+                description: `${degrees}°: Model ${testSize.x.toFixed(1)}×${testSize.z.toFixed(1)} vs Target ${targetX.toFixed(1)}×${targetZ.toFixed(1)} = Error ${totalError.toFixed(3)}`
+            });
+            
+            // Prefer 0° rotation if errors are very close (within 0.1)
+            const isBetter = totalError < this.bestScore;
+            const isSimilarButPreferNoRotation = (Math.abs(totalError - this.bestScore) < 0.1 && degrees === 0);
+            
+            if (isBetter || isSimilarButPreferNoRotation) {
+                this.bestScore = totalError;
+                this.bestRotation = rotation;
+                bestRotationDegrees = degrees;
+            }
+        }
+        
+        // Reset to 0 rotation to show the search process
+        this.gltfRoot.rotation.y = 0;
+        this.gltfRoot.updateMatrixWorld(true);
+        
+        // Sort results by error for display
+        rotationResults.sort((a, b) => a.error - b.error);
+        
+        this.stepTitle.textContent = "Step 8: Finding Optimal Rotation";
+        this.stepDescription.textContent = "Testing the 4 cardinal rotations (0°, 90°, 180°, 270°) to find the best alignment with the structure's footprint.";
+        this.stepValues.textContent = `Model footprint at different rotations:
+${rotationResults.map(r => r.description).join('\n')}
+
+✅ Best rotation: ${bestRotationDegrees}° (error: ${this.bestScore.toFixed(3)})
+
+This avoids weird angles and uses logical orientations.`;
+    }
+    
+    step9_ApplyRotation() {
+        // Actually apply the optimal rotation
+        this.gltfRoot.rotation.y = this.bestRotation;
+        this.gltfRoot.updateMatrixWorld(true);
+        
+        const rotatedBox = new THREE.Box3().setFromObject(this.gltfRoot);
+        const rotatedSize = rotatedBox.getSize(new THREE.Vector3());
+        
+        const appliedDegrees = (this.bestRotation * 180 / Math.PI);
+        
+        this.stepTitle.textContent = "Step 9: Apply Optimal Rotation";
+        this.stepDescription.textContent = "Applying the best rotation found. If this looks wrong, you can manually adjust it later using the transform controls.";
+        this.stepValues.textContent = `✅ Applied rotation: ${appliedDegrees.toFixed(0)}°
+
+Final model footprint: ${rotatedSize.x.toFixed(2)} × ${rotatedSize.z.toFixed(2)}
+Target structure footprint: ${(this.structureSize.x + 1).toFixed(1)} × ${(this.structureSize.z + 1).toFixed(1)}
+
+If this doesn't look right visually:
+- Complete the placement process
+- Enter focus mode (F key)
+- Use the rotation tool to manually adjust
+
+The algorithm picks the mathematically best fit,
+but sometimes visual alignment is more important!`;
+    }
+    
+    step6_CalculateScale() {
+        const modelBoxAtOrigin = new THREE.Box3().setFromObject(this.gltfRoot);
+        const modelSizeAtOrigin = modelBoxAtOrigin.getSize(new THREE.Vector3());
+        
+        const actualStructureSize = new THREE.Vector3(
+            this.structureSize.x + 1,
+            this.structureSize.y + 1,
+            this.structureSize.z + 1
+        );
+        
+        const scaleX = actualStructureSize.x / modelSizeAtOrigin.x;
+        const scaleY = actualStructureSize.y / modelSizeAtOrigin.y;
+        const scaleZ = actualStructureSize.z / modelSizeAtOrigin.z;
+        
+        const scales = [scaleX, scaleY, scaleZ].sort((a, b) => a - b);
+        this.uniformScale = scales[1]; // median
+        
+        this.stepTitle.textContent = "Step 6: Calculate Scale Factor";
+        this.stepDescription.textContent = "Computing the scale needed to match the model size to the structure size. Using median scale for best overall fit.";
+        this.stepValues.textContent = `Individual scales:
+X-axis: ${scaleX.toFixed(3)}
+Y-axis: ${scaleY.toFixed(3)}
+Z-axis: ${scaleZ.toFixed(3)}
+Median scale: ${scales[1].toFixed(3)}
+Final scale: ${this.uniformScale.toFixed(3)}`;
+    }
+    
+    step7_ApplyScale() {
+        // Actually apply the scale
+        this.gltfRoot.scale.setScalar(this.uniformScale);
+        this.gltfRoot.updateMatrixWorld(true);
+        
+        const scaledBox = new THREE.Box3().setFromObject(this.gltfRoot);
+        const scaledSize = scaledBox.getSize(new THREE.Vector3());
+        
+        this.stepTitle.textContent = "Step 7: Apply Scale";
+        this.stepDescription.textContent = "Scaling the model uniformly to match the structure dimensions. Watch the model resize!";
+        this.stepValues.textContent = `Scale applied: ${this.uniformScale.toFixed(3)}
+Scaled model size: ${scaledSize.x.toFixed(2)} × ${scaledSize.y.toFixed(2)} × ${scaledSize.z.toFixed(2)}`;
+    }
+    
+    step10_FinalPosition() {
+        const scaledRotatedBox = new THREE.Box3().setFromObject(this.gltfRoot);
+        const yOffset = this.bounds.min.y - scaledRotatedBox.min.y;
+        const finalPosition = new THREE.Vector3(
+            this.targetCenter.x,
+            yOffset,
+            this.targetCenter.z
+        );
+        
+        // Actually move to final position
+        this.gltfRoot.position.copy(finalPosition);
+        
+        this.stepTitle.textContent = "Step 10: Final Positioning";
+        this.stepDescription.textContent = "Moving the scaled and rotated model to the structure's location. Aligning the bottom of the model with the structure's base. Watch the model move to its final position!";
+        this.stepValues.textContent = `Y offset calculation:
+Structure base Y: ${this.bounds.min.y.toFixed(2)}
+Model base Y (before move): ${scaledRotatedBox.min.y.toFixed(2)}
+Y offset: ${yOffset.toFixed(2)}
+
+Final position: (${finalPosition.x.toFixed(2)}, ${finalPosition.y.toFixed(2)}, ${finalPosition.z.toFixed(2)})
+
+Model placement complete! The model is now:
+- Correctly scaled to structure size
+- Optimally rotated for best shape alignment  
+- Positioned exactly over the target structure`;
+    }
+    
+    step11_Complete() {
+        // Store the model in the tracking map
+        placedModelsByStructure.set(this.structureId, {
+            group: this.modelGroup,
+            glbUrl: this.glbUrl
+        });
+        
+        // Set as active model if this is for the focused structure
+        if (focusedStructure && this.structureId === focusedStructure.id) {
+            tripoModelGroup = this.modelGroup;
+            tripoPlacementEnabled = true;
+            
+            // Show transform controls in focus mode
+            if (focusMode) {
+                attachTripoTransformControls(tripoModelGroup);
+            }
+        }
+        
+        // Update focus mode visibility if active
+        if (focusMode) {
+            updateFocusModeVisibility();
+        }
+        
+        this.stepTitle.textContent = "Step 11: Complete - Model Placed";
+        this.stepDescription.textContent = "The 3D model has been successfully placed in the scene with optimal alignment to the structure.";
+        this.stepValues.textContent = `Model group created and added to scene
+Structure ID: ${this.structureId}
+Model tracking: Active
+Transform controls: ${focusMode ? 'Available' : 'Hidden (enter focus mode to adjust)'}
+Placement complete! ✓`;
+    }
 }
