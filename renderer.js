@@ -65,11 +65,15 @@ const PERSIST_ENABLED_KEY = 'moduland_persist_enabled';
 let foundationGroup = null; // temporary base shown in focus/capture
 let showFoundation = false;
 let treeMarkerGroup = null; // persistent tree when foundation toggle is on
+let originMarker = null; // marker for scene (0,0,0)
 
 // --- Simple transform panel ---
 let transformPanel = null;
 let transformPanelObject = null;
 let isUpdatingFromPanel = false;
+
+// --- Axis indicator ---
+let axisScene, axisCamera, axisRenderer, axisHelper;
 
 function showTransformPanel(object) {
     transformPanelObject = object;
@@ -222,6 +226,9 @@ function init() {
     
     createGroundGrid();
     
+    // Show origin marker at (0,0,0)
+    try { setOriginMarkerVisible(true); } catch {}
+    
     gizmoGroup = new THREE.Group();
     scene.add(gizmoGroup);
     
@@ -241,6 +248,12 @@ function init() {
     } catch (error) {
         console.error('Error initializing scene:', error);
     }
+
+    // Axis indicator removed
+    axisScene = null;
+    axisCamera = null;
+    axisRenderer = null;
+    axisHelper = null;
 }
 
 function createGroundGrid() {
@@ -330,6 +343,33 @@ function clearGroundGrid() {
         if (child.geometry) child.geometry.dispose();
         if (child.material) child.material.dispose();
     });
+}
+
+// Origin marker at (0,0,0)
+function ensureOriginMarker() {
+	if (originMarker) return originMarker;
+	const group = new THREE.Group();
+	group.name = 'originMarker';
+	const size = Math.max(0.5, 0.8 * voxelSize);
+	const thickness = Math.max(0.02, 0.06 * voxelSize);
+	const cylGeo = new THREE.CylinderGeometry(thickness, thickness, size, 8);
+	const matX = new THREE.MeshBasicMaterial({ color: 0xff3333 });
+	const matY = new THREE.MeshBasicMaterial({ color: 0x33ff33 });
+	const matZ = new THREE.MeshBasicMaterial({ color: 0x3333ff });
+	const mx = new THREE.Mesh(cylGeo, matX); mx.rotation.z = Math.PI/2; mx.position.x = size/2; group.add(mx);
+	const mz = new THREE.Mesh(cylGeo, matZ); mz.rotation.x = Math.PI/2; mz.position.z = size/2; group.add(mz);
+	const my = new THREE.Mesh(cylGeo, matY); my.position.y = size/2; group.add(my);
+	const axes = new THREE.AxesHelper(size * 0.9);
+	axes.material.depthTest = false; axes.renderOrder = 999; group.add(axes);
+	group.traverse(n=>{ if(n.isMesh){ n.renderOrder = 998; }});
+	group.position.set(0, 0, 0);
+	originMarker = group;
+	scene.add(group);
+	return group;
+}
+function setOriginMarkerVisible(visible) {
+	const m = ensureOriginMarker();
+	m.visible = !!visible;
 }
 
 function setupControls() {
@@ -807,7 +847,7 @@ function enterFocusMode() {
         toggleSelection(voxel);
     });
     
-    // Update visibility - hide all non-structure voxels
+    // Update visibility - hide all non-structure voxels and ground grid
     updateFocusModeVisibility();
     
     // Show focus indicator
@@ -818,12 +858,12 @@ function enterFocusMode() {
     const buildifyMenu = document.getElementById('buildify-menu');
     buildifyMenu.style.display = 'flex';
     
-    // Raise ground plane/grid to top of base layer
+    // Ensure foundation exists, then raise overlay grid but keep it hidden
     setGroundElevation(true);
     if (showFoundation) {
         createOrUpdateFoundation();
-        setGridOverlayVisible(false);
     }
+    setGridOverlayVisible(false);
     
     console.log('Entered focus mode for structure:', focusedStructure.name);
 }
@@ -853,7 +893,7 @@ function exitFocusMode() {
         voxel.visible = true;
         
         // Also restore edge visibility
-        if (voxel.userData.edges) {
+        if (voxel.userData && voxel.userData.edges) {
             voxel.userData.edges.visible = true;
         }
     });
@@ -881,11 +921,12 @@ function exitFocusMode() {
     
     // Lower ground plane/grid back to base
     setGroundElevation(false);
-    removeFoundation();
+    if (!showFoundation) {
+        removeFoundation();
+    }
     removeTreeMarker();
     setGridOverlayVisible(true);
-    // Keep any applied skin overlay visible outside focus mode
- 
+    
     console.log('Exited focus mode, updated structure with', focusedStructureVoxels.size, 'voxels');
 }
 
@@ -900,27 +941,26 @@ function updateFocusModeVisibility() {
 
     const allVoxels = [...groundGrid.flat(), ...voxels];
     allVoxels.forEach(voxel => {
-        // Always keep ground grid visible in focus mode to appear in captures
+        // Hide ground grid segments in focus mode; foundation is separate and remains visible
         if (voxel.userData?.type === 'ground') {
-            voxel.visible = true;
-            if (voxel.userData.edges) voxel.userData.edges.visible = true;
+            voxel.visible = false;
+            if (voxel.userData.edges) voxel.userData.edges.visible = false;
             return;
         }
         // Show only voxels that are part of the focused structure
         const isVisible = focusedStructureVoxels.has(voxel);
         voxel.visible = isVisible;
         
-        // Also update edge visibility
-        if (voxel.userData.edges) {
+        // Also toggle edge visibility
+        if (voxel.userData && voxel.userData.edges) {
             voxel.userData.edges.visible = isVisible;
         }
     });
-    
-    // Show only models associated with the current focused structure
+
+    // Hide all unrelated placed models when focusing on a structure
     placedModelsByStructure.forEach((modelData, structureId) => {
-        const shouldShow = focusedStructure && structureId === focusedStructure.id;
         if (modelData.group) {
-            modelData.group.visible = shouldShow;
+            modelData.group.visible = (focusedStructure && structureId === focusedStructure.id);
         }
     });
 }
@@ -1073,10 +1113,11 @@ async function handleCaptureStructure() {
         // Only capture the color image (remove depth capture)
         const size = 768;
         const camIso = createOrthoObliqueCameraToFit(bounds, size, size, DEFAULT_ISO_ELEVATION_DEG, DEFAULT_ISO_AZIMUTH_DEG);
-        expandOrthoFrustum(camIso, 1.15);
+        // Give more headroom so the foundation (outer ring and corner cut) is never cropped
+        expandOrthoFrustum(camIso, 1.30);
         camIso.updateMatrixWorld(true);
 
-        // Ensure foundation exists for capture, extending toward tree side
+        // Ensure foundation exists for capture and remove bottom-right corner relative to this camera
         if (showFoundation) {
             createOrUpdateFoundation(bounds, camIso);
             setGridOverlayVisible(false);
@@ -2565,6 +2606,12 @@ function animate() {
     renderer.render(scene, camera);
     updateScreenOverlayVisibility();
     updateScreenOverlayTransform();
+
+    // Update axis indicator orientation
+    if (axisCamera && axisRenderer) {
+        axisCamera.quaternion.copy(camera.quaternion);
+        axisRenderer.render(axisScene, axisCamera);
+    }
 }
 
 if (document.readyState === 'loading') {
@@ -3676,13 +3723,15 @@ function isTypingIntoInput(event) {
 }
 
 function setGroundElevation(raised) {
-    const y = raised ? voxelSize * 0.5 : 0;
+    // Ground is always at the foot of the structure (top of ground grid): y = 0
+    const y = 0;
     scene.children.forEach(child => {
         if (child.userData && (child.userData.isGridHelper || child.userData.isGridPlane)) {
             child.position.y = y;
             if (typeof child.updateMatrixWorld === 'function') child.updateMatrixWorld(true);
         }
     });
+    if (originMarker) originMarker.position.y = y;
 }
 
 async function addSkinToFocusedStructure(imageUrl) {
@@ -5086,163 +5135,56 @@ function removeFoundation() {
     }
 }
 
-function createOrUpdateFoundation(boundsOverride = null, camForTree = null) {
-    const bounds = boundsOverride || (focusedStructure ? computeFocusedStructureBounds() : null);
-    if (!bounds) return;
+function createOrUpdateFoundation(boundsOverride = null, camForCorner = null) {
+    // Remove any previous foundation
     removeFoundation();
-    foundationGroup = new THREE.Group();
-    foundationGroup.userData.__foundation = true;
-    const unit = voxelSize * 0.1; // thin voxel unit
-    const height = Math.max(unit*2, unit*3); // 0.2–0.3 of a segment
-    // Material: much lighter than tree to avoid blending
-    const mat = new THREE.MeshPhongMaterial({ color: 0xd8e1ff });
-    // Base dilation radius
-    const baseRadius = 1.5; // segments
-    const step = 0.1; // sampling granularity
 
-    // Collect ground-level occupied integer cells from the structure
-    const groundY = Math.round(bounds.min.y);
-    const groundCells = new Set();
+    // Use available bounds or compute from current structure
+    const bounds = boundsOverride || computeFocusedStructureBounds();
+    if (!bounds) return;
+
+    const unit = voxelSize; // 1 segment
+    const height = 0.5 * unit; // 0.5 segment high
+
+    // Compute footprint bounding box across ALL voxels in XZ (ignore Y)
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    let foundAny = false;
     focusedStructureVoxels.forEach(v => {
-        const p = v.position;
-        if (Math.round(p.y) === groundY) {
-            groundCells.add(`${Math.round(p.x)}|${Math.round(p.z)}`);
-        }
+        const x = Math.round(v.position.x);
+        const z = Math.round(v.position.z);
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (z < minZ) minZ = z;
+        if (z > maxZ) maxZ = z;
+        foundAny = true;
     });
-    if (groundCells.size === 0) {
-        // fallback: dilate full bounds footprint
-        for (let gx = Math.round(bounds.min.x); gx <= Math.round(bounds.max.x); gx++) {
-            for (let gz = Math.round(bounds.min.z); gz <= Math.round(bounds.max.z); gz++) {
-                groundCells.add(`${gx}|${gz}`);
-            }
+    if (!foundAny || !isFinite(minX)) return;
+
+    // Take all segments beneath the footprint bounding box AND their outer neighbors
+    const rMinX = minX - 1;
+    const rMaxX = maxX + 1;
+    const rMinZ = minZ - 1;
+    const rMaxZ = maxZ + 1;
+
+    // Remove the corner opposite along the Z axis (NE corner in world axes)
+    const skipKey = `${rMaxX}|${rMaxZ}`;
+
+    const g = new THREE.BoxGeometry(unit, height, unit);
+    const mat = new THREE.MeshPhongMaterial({ color: 0xd8e1ff });
+    foundationGroup = new THREE.Group();
+
+    for (let x = rMinX; x <= rMaxX; x++) {
+        for (let z = rMinZ; z <= rMaxZ; z++) {
+            if (`${x}|${z}` === skipKey) continue; // remove the bottom-right corner cell
+            const m = new THREE.Mesh(g, mat);
+            // Center Y so top face is at top of ground grid (y = voxelSize * 0.5)
+            const topY = voxelSize * 0.5;
+            m.position.set(x, topY - height * 0.5, z);
+            foundationGroup.add(m);
         }
     }
-
-    // Build dilated sample set (union of squares around every ground cell)
-    const samples = new Set();
-    const addSample = (x,z) => { samples.add(`${(Math.round(x*10)/10).toFixed(1)}|${(Math.round(z*10)/10).toFixed(1)}`); };
-
-    const r = baseRadius;
-    groundCells.forEach(key => {
-        const [gxStr, gzStr] = key.split('|');
-        const gx = parseInt(gxStr, 10);
-        const gz = parseInt(gzStr, 10);
-        for (let dx = -r; dx <= r + 1e-6; dx += step) {
-            for (let dz = -r; dz <= r + 1e-6; dz += step) {
-                addSample(gx + dx, gz + dz);
-            }
-        }
-    });
-
-    // If we have the capture camera, also seed samples around the tree's ground position
-    let treePosCorridor = null;
-    if (camForTree) {
-        const raycaster = new THREE.Raycaster();
-        const ndc = new THREE.Vector2(-0.68, -0.8);
-        raycaster.setFromCamera(ndc, camForTree);
-        const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -bounds.min.y);
-        const treePos = new THREE.Vector3();
-        raycaster.ray.intersectPlane(groundPlane, treePos);
-        const half = 0.8; // seed region half-size to guarantee coverage
-        for (let x = treePos.x - half; x <= treePos.x + half + 1e-6; x += step) {
-            for (let z = treePos.z - half; z <= treePos.z + half + 1e-6; z += step) {
-                addSample(x, z);
-            }
-        }
-        treePosCorridor = treePos.clone();
-    }
-
-    // If no capture camera (live toggle) but tree marker exists, use its position
-    if (!treePosCorridor && treeMarkerGroup) {
-        treePosCorridor = treeMarkerGroup.position.clone();
-        const half = 0.8;
-        for (let x = treePosCorridor.x - half; x <= treePosCorridor.x + half + 1e-6; x += step) {
-            for (let z = treePosCorridor.z - half; z <= treePosCorridor.z + half + 1e-6; z += step) {
-                addSample(x, z);
-            }
-        }
-    }
-
-    // Determine current sample bounds
-    let sMinX = Infinity, sMaxX = -Infinity, sMinZ = Infinity, sMaxZ = -Infinity;
-    samples.forEach(k => {
-        const [xs, zs] = k.split('|');
-        const x = parseFloat(xs); const z = parseFloat(zs);
-        if (x < sMinX) sMinX = x; if (x > sMaxX) sMaxX = x;
-        if (z < sMinZ) sMinZ = z; if (z > sMaxZ) sMaxZ = z;
-    });
-
-    // Extend only toward the tree direction by another baseRadius (corner extension)
-    if (camForTree) {
-        const center = new THREE.Vector3().addVectors(bounds.min, bounds.max).multiplyScalar(0.5);
-        const camDir = center.clone().sub(camForTree.position).normalize();
-        const right = new THREE.Vector3().crossVectors(camDir, new THREE.Vector3(0,1,0)).normalize();
-        const forward = new THREE.Vector3(camDir.x, 0, camDir.z).normalize();
-        const push = forward.clone().add(right.clone().multiplyScalar(-1)).normalize();
-        const extra = baseRadius; // extra reach
-        const xStart = (push.x < 0) ? sMinX - extra : sMaxX;
-        const xEnd   = (push.x < 0) ? sMinX : sMaxX + extra;
-        const zStart = (push.z < 0) ? sMinZ - extra : sMaxZ;
-        const zEnd   = (push.z < 0) ? sMinZ : sMaxZ + extra;
-        for (let x = xStart; x <= xEnd + 1e-6; x += step) {
-            for (let z = zStart; z <= zEnd + 1e-6; z += step) {
-                addSample(x, z);
-            }
-        }
-    }
-
-    // Build meshes from samples with a soft crumbling edge near overall sample bounds
-    const yBase = bounds.min.y - height + unit*0.5;
-    const noise = (x,z)=> (Math.sin(x*0.7)+Math.cos(z*0.8))*0.5 + (Math.random()*0.4-0.2);
-    samples.forEach(k => {
-        const [xs, zs] = k.split('|');
-        const x = parseFloat(xs); const z = parseFloat(zs);
-        // Crumble probability increases near the outer sample bounds
-        const edgeDist = Math.min(Math.abs(x - sMinX), Math.abs(x - sMaxX), Math.abs(z - sMinZ), Math.abs(z - sMaxZ));
-        const crumbleProb = Math.max(0, 0.5 - edgeDist*0.35);
-        if (Math.random() < crumbleProb) return;
-        const g = new THREE.BoxGeometry(unit, height, unit);
-        const m = mat.clone();
-        const mesh = new THREE.Mesh(g, m);
-        mesh.position.set(x, yBase + height*0.5 + noise(x,z)*0.02, z);
-        foundationGroup.add(mesh);
-    });
 
     scene.add(foundationGroup);
-    if (showFoundation) {
-        // No live tree; only added during capture
-    }
-
-    // ------------------------------------------------------------------
-    //  Add a non-crumbled corridor of voxels to guarantee connectivity   
-    // ------------------------------------------------------------------
-    if (treePosCorridor) {
-        const center = new THREE.Vector3().addVectors(bounds.min, bounds.max).multiplyScalar(0.5);
-        const dir = new THREE.Vector3().subVectors(treePosCorridor, center);
-        const len = dir.length();
-        if (len > 0.1) {
-            dir.normalize();
-            const perp = new THREE.Vector3(-dir.z, 0, dir.x); // perpendicular in XZ plane
-            const gCorr = new THREE.BoxGeometry(unit, height, unit);
-            const matCorr = mat.clone();
-            const maxW = baseRadius; // widest near structure
-            const minW = 1.0;        // narrow near tree (approx 1 segment)
-            const stepAlong = unit;   // along-path spacing
-            const stepAcross = unit;  // across-path spacing
-            for (let d = 0; d <= len + 1e-6; d += stepAlong) {
-                const t = d / len;
-                const widthHere = maxW - (maxW - minW) * t; // linear taper
-                const pCenter = new THREE.Vector3(center.x + dir.x * d, yBase + height*0.5, center.z + dir.z * d);
-                for (let off = -widthHere; off <= widthHere + 1e-6; off += stepAcross) {
-                    const pX = pCenter.x + perp.x * off;
-                    const pZ = pCenter.z + perp.z * off;
-                    const mesh = new THREE.Mesh(gCorr, matCorr);
-                    mesh.position.set(pX, pCenter.y, pZ);
-                    foundationGroup.add(mesh);
-                }
-            }
-        }
-    }
 }
 
 function removeTreeMarker() {
@@ -5283,92 +5225,9 @@ function positionTreeMarker(bounds, cam) {
 }
 
 function createOrUpdateTreeMarker(boundsOverride = null, camForPlacement = null) {
-    // Only place the tree when we have a focused structure; otherwise skip to avoid using grid bounds
-    if (!boundsOverride) {
-        if (!focusMode || !focusedStructure) return;
-    }
-    const bounds = boundsOverride || computeFocusedStructureBounds();
-    if (!bounds) return;
-    // Build capture-like camera to compute consistent bottom-left world position
-    const size = 768;
-    const camIso = createOrthoObliqueCameraToFit(bounds, size, size, DEFAULT_ISO_ELEVATION_DEG, DEFAULT_ISO_AZIMUTH_DEG);
-    expandOrthoFrustum(camIso, 1.15);
-    camIso.updateMatrixWorld(true);
-
-    const raycaster = new THREE.Raycaster();
-    const ndc = new THREE.Vector2(-0.68, -0.8);
-    raycaster.setFromCamera(ndc, camIso);
-    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -bounds.min.y);
-    const treePos = new THREE.Vector3();
-    raycaster.ray.intersectPlane(groundPlane, treePos);
-
-    if (!treeMarkerGroup) {
-        // Build voxel tree (same style as capture)
-        treeMarkerGroup = new THREE.Group();
-        treeMarkerGroup.userData.__treeMarker = true;
-        const unit = 0.1 * voxelSize;
-        const structColor = 0x4444ff;
-        const mat = new THREE.MeshPhongMaterial({ color: structColor });
-        const makeVoxel = (x,y,z)=>{ const g=new THREE.BoxGeometry(unit,unit,unit); const m=mat.clone(); const mesh=new THREE.Mesh(g,m); mesh.position.set(x,y,z); treeMarkerGroup.add(mesh); };
-        const trunkH = Math.round(1.35 / 0.1);
-        for (let iy = 0; iy < trunkH; iy++) {
-            const r = Math.max(1, Math.round((0.2 - iy * 0.2 / trunkH) / 0.1));
-            for (let ix = -r; ix <= r; ix++) {
-                for (let iz = -r; iz <= r; iz++) {
-                    if (ix*ix + iz*iz <= r*r) makeVoxel(ix*unit, iy*unit, iz*unit, mat);
-                }
-            }
-        }
-        const branchSpecs = [
-            { h: 0.6,  a: -35, len: 0.6 },
-            { h: 0.9,  a: 25,  len: 0.55 },
-            { h: 1.15, a: 70,  len: 0.5 },
-            { h: 1.05, a: 150, len: 0.45 }
-        ];
-        const toRad = (d)=>d*Math.PI/180;
-        for (const b of branchSpecs) {
-            const yBase = Math.round(b.h / 0.1) * unit;
-            const steps = Math.round(b.len / 0.1);
-            const dir = new THREE.Vector3(Math.cos(toRad(b.a)), 0, Math.sin(toRad(b.a)));
-            for (let s = 1; s <= steps; s++) {
-                const p = dir.clone().multiplyScalar(s*unit);
-                makeVoxel(p.x, yBase + Math.round(s*0.03/unit)*unit, p.z, mat);
-                if (s % 3 === 0) {
-                    const side = new THREE.Vector3(-dir.z, 0, dir.x).multiplyScalar(unit);
-                    makeVoxel(p.x + side.x, yBase + Math.round(s*0.03/unit)*unit, p.z + side.z, mat);
-                }
-            }
-            const tip = dir.clone().multiplyScalar(steps*unit);
-            const rLeaf = Math.round(0.3 / 0.1);
-            for (let iy = -rLeaf; iy <= rLeaf; iy++) {
-                for (let ix = -rLeaf; ix <= rLeaf; ix++) {
-                    for (let iz = -rLeaf; iz <= rLeaf; iz++) {
-                        const ell = (ix*ix)/(rLeaf*rLeaf) + (iy*iy)/(rLeaf*rLeaf*0.7) + (iz*iz)/(rLeaf*rLeaf);
-                        if (ell <= 1.0 && Math.random() > 0.12) {
-                            makeVoxel(tip.x + ix*unit, yBase + iy*unit, tip.z + iz*unit, mat);
-                        }
-                    }
-                }
-            }
-        }
-        const crownR = Math.round(0.7 / 0.1);
-        const crownBaseY = Math.round(1.35 / 0.1) * unit + 2 * unit;
-        for (let iy = 0; iy <= crownR; iy++) {
-            const layerR = crownR - iy + (Math.random()>0.6? -1:0);
-            for (let ix = -layerR; ix <= layerR; ix++) {
-                for (let iz = -layerR; iz <= layerR; iz++) {
-                    if (ix*ix + iz*iz <= layerR*layerR && Math.random() > 0.1) {
-                        makeVoxel(ix*unit, crownBaseY + iy*unit, iz*unit, mat);
-                    }
-                }
-            }
-        }
-        scene.add(treeMarkerGroup);
-    }
-    // Use the provided placement camera if present (e.g., during capture); otherwise
-    // fall back to the internally-generated capture-like camIso so tree placement is
-    // independent of the user's current scene camera orientation.
-    positionTreeMarker(bounds, camForPlacement || camIso);
+    // Remove any existing tree and do nothing (tree disabled)
+    removeTreeMarker();
+    return;
 }
 
 // Fit button
