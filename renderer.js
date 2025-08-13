@@ -225,7 +225,7 @@ function showSWCornerHighlight() {
     cornerDefs.forEach(corner => {
         const width = corner.maxX - corner.minX;
         const depth = corner.maxZ - corner.minZ;
-        const height = 0.2;
+        const height = 1.0;  // Full voxel height
         
         const box = new THREE.Mesh(
             new THREE.BoxGeometry(width, height, depth),
@@ -237,9 +237,10 @@ function showSWCornerHighlight() {
             })
         );
         
+        // Position at the center of the voxel (lowered by 0.5)
         box.position.set(
             (corner.minX + corner.maxX) / 2,
-            sInfo.baseY,
+            sInfo.baseY + height / 2 - 0.5,  // Center vertically and lower by 0.5
             (corner.minZ + corner.maxZ) / 2
         );
         
@@ -287,18 +288,19 @@ function updateCornerScores() {
     // Define 1x1 corner regions one voxel outside the structure diagonally (same as visual highlights)
     const voxelSize = 1.0;
     const corners = {
-        SW: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize, 
-              minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
-        SE: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX, 
-              minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
-        NW: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize, 
-              minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ },
-        NE: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX, 
-              minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ }
+        Yellow: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize,  // SW (max X, max Z)
+                  minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
+        Red: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX,     // SE (min X, max Z)
+               minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
+        Green: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize,   // NW (max X, min Z)
+                 minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ },
+        Blue: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX,    // NE (min X, min Z)
+                minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ }
     };
     
     // Check if each corner region contains model geometry (filled vs empty)
-    let cornerStatus = { SW: false, SE: false, NW: false, NE: false };
+    let cornerStatus = { Yellow: false, Red: false, Green: false, Blue: false };
+    let cornerHitCounts = { Yellow: 0, Red: 0, Green: 0, Blue: 0 };
     const yTolerance = 0.5;
     
     // Use raycasting to detect if there's geometry in each corner
@@ -307,44 +309,63 @@ function updateCornerScores() {
     Object.keys(corners).forEach(cornerName => {
         const corner = corners[cornerName];
         
-        // Test multiple points within the corner region
+        // Test a 3D grid of 12 points within the corner region
+        const offset = 0.1;
+        const midX = (corner.minX + corner.maxX) / 2;
+        const midZ = (corner.minZ + corner.maxZ) / 2;
+        
+        // Define test points: 8 corners + 4 middle points (lowered by 0.5)
         const testPoints = [
-            { x: corner.minX + 0.1, z: corner.minZ + 0.1 },
-            { x: corner.maxX - 0.1, z: corner.minZ + 0.1 },
-            { x: corner.minX + 0.1, z: corner.maxZ - 0.1 },
-            { x: corner.maxX - 0.1, z: corner.maxZ - 0.1 },
-            { x: (corner.minX + corner.maxX) / 2, z: (corner.minZ + corner.maxZ) / 2 }
+            // Bottom 4 corners (at base level - 0.5)
+            { x: corner.minX + offset, y: sInfo.baseY - 0.5, z: corner.minZ + offset },
+            { x: corner.maxX - offset, y: sInfo.baseY - 0.5, z: corner.minZ + offset },
+            { x: corner.minX + offset, y: sInfo.baseY - 0.5, z: corner.maxZ - offset },
+            { x: corner.maxX - offset, y: sInfo.baseY - 0.5, z: corner.maxZ - offset },
+            
+            // Top 4 corners (at base level)
+            { x: corner.minX + offset, y: sInfo.baseY, z: corner.minZ + offset },
+            { x: corner.maxX - offset, y: sInfo.baseY, z: corner.minZ + offset },
+            { x: corner.minX + offset, y: sInfo.baseY, z: corner.maxZ - offset },
+            { x: corner.maxX - offset, y: sInfo.baseY, z: corner.maxZ - offset },
+            
+            // 4 middle points at mid-height (base - 0.25)
+            { x: midX, y: sInfo.baseY - 0.25, z: corner.minZ + offset },
+            { x: midX, y: sInfo.baseY - 0.25, z: corner.maxZ - offset },
+            { x: corner.minX + offset, y: sInfo.baseY - 0.25, z: midZ },
+            { x: corner.maxX - offset, y: sInfo.baseY - 0.25, z: midZ }
         ];
         
-        // Cast rays downward from above to check for geometry
+        // Check each test point with raycasting
+        let hitCount = 0;
         for (const point of testPoints) {
             raycaster.set(
-                new THREE.Vector3(point.x, sInfo.baseY + 2, point.z),
+                new THREE.Vector3(point.x, point.y + 2, point.z),
                 new THREE.Vector3(0, -1, 0)
             );
             
             const intersects = raycaster.intersectObject(transformPanelObject, true);
             
-            // Check if any intersection is near the base level
+            // Check if there's geometry at this point
             for (const hit of intersects) {
-                if (Math.abs(hit.point.y - sInfo.baseY) < yTolerance) {
-                    cornerStatus[cornerName] = true;
+                if (Math.abs(hit.point.y - point.y) < yTolerance) {
+                    hitCount++;
                     break;
                 }
             }
-            
-            if (cornerStatus[cornerName]) break;
         }
+        
+        // Store hit count and determine if filled
+        cornerHitCounts[cornerName] = hitCount;
+        cornerStatus[cornerName] = hitCount > 3;
     });
     
-    // Update the display with filled (■) or empty (□) indicators
-    const getIcon = (filled) => filled ? '■' : '□';
+    // Update the display with hit counts
     const getStyle = (filled) => filled ? 'color:#0a0' : 'color:#d00';
     
-    document.getElementById('swScore').innerHTML = `<span style="${getStyle(cornerStatus.SW)}">${getIcon(cornerStatus.SW)}</span>`;
-    document.getElementById('seScore').innerHTML = `<span style="${getStyle(cornerStatus.SE)}">${getIcon(cornerStatus.SE)}</span>`;
-    document.getElementById('nwScore').innerHTML = `<span style="${getStyle(cornerStatus.NW)}">${getIcon(cornerStatus.NW)}</span>`;
-    document.getElementById('neScore').innerHTML = `<span style="${getStyle(cornerStatus.NE)}">${getIcon(cornerStatus.NE)}</span>`;
+    document.getElementById('swScore').innerHTML = `<span style="${getStyle(cornerStatus.Yellow)}">Yellow: ${cornerHitCounts.Yellow}/12</span>`;
+    document.getElementById('seScore').innerHTML = `<span style="${getStyle(cornerStatus.Red)}">Red: ${cornerHitCounts.Red}/12</span>`;
+    document.getElementById('nwScore').innerHTML = `<span style="${getStyle(cornerStatus.Green)}">Green: ${cornerHitCounts.Green}/12</span>`;
+    document.getElementById('neScore').innerHTML = `<span style="${getStyle(cornerStatus.Blue)}">Blue: ${cornerHitCounts.Blue}/12</span>`;
 }
 
 function updateTransformPanel() {
@@ -5985,18 +6006,21 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
     // Define corner regions at structure's outer corners (where missing voxels would be)
     const voxelSize = 1.0;
     const corners = {
-        SW: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize, 
-              minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
-        SE: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX, 
-              minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
-        NW: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize, 
-              minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ },
-        NE: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX, 
-              minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ }
+        Yellow: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize,  // SW (max X, max Z)
+                  minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
+        Red: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX,     // SE (min X, max Z)
+               minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
+        Green: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize,   // NW (max X, min Z)
+                 minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ },
+        Blue: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX,    // NE (min X, min Z)
+                minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ }
     };
     
     const raycaster = new THREE.Raycaster();
     const yTolerance = 0.5;
+    
+    let lowestYellowScore = Infinity;
+    let rotationScores = [];
     
     for (let i = 0; i < 4; i++) {
         const testRotation = baseRotation + (i * Math.PI / 2);
@@ -6004,57 +6028,97 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
         obj.updateMatrixWorld(true);
         
         // Check if each corner contains geometry using raycasting
-        let cornerStatus = { SW: false, SE: false, NW: false, NE: false };
+        let cornerStatus = { Yellow: false, Red: false, Green: false, Blue: false };
+        let cornerHitCounts = { Yellow: 0, Red: 0, Green: 0, Blue: 0 };
         
         Object.keys(corners).forEach(cornerName => {
             const corner = corners[cornerName];
             
-            // Test multiple points within the corner region
+            // Test a 3D grid of 12 points within the corner region
+            const offset = 0.1; // Small offset from edges
+            const midX = (corner.minX + corner.maxX) / 2;
+            const midZ = (corner.minZ + corner.maxZ) / 2;
+            
+            // Define test points: 8 corners + 4 middle points (lowered by 0.5)
             const testPoints = [
-                { x: corner.minX + 0.1, z: corner.minZ + 0.1 },
-                { x: corner.maxX - 0.1, z: corner.minZ + 0.1 },
-                { x: corner.minX + 0.1, z: corner.maxZ - 0.1 },
-                { x: corner.maxX - 0.1, z: corner.maxZ - 0.1 },
-                { x: (corner.minX + corner.maxX) / 2, z: (corner.minZ + corner.maxZ) / 2 }
+                // Bottom 4 corners (at base level - 0.5)
+                { x: corner.minX + offset, y: sInfo.baseY - 0.5, z: corner.minZ + offset },
+                { x: corner.maxX - offset, y: sInfo.baseY - 0.5, z: corner.minZ + offset },
+                { x: corner.minX + offset, y: sInfo.baseY - 0.5, z: corner.maxZ - offset },
+                { x: corner.maxX - offset, y: sInfo.baseY - 0.5, z: corner.maxZ - offset },
+                
+                // Top 4 corners (at base level)
+                { x: corner.minX + offset, y: sInfo.baseY, z: corner.minZ + offset },
+                { x: corner.maxX - offset, y: sInfo.baseY, z: corner.minZ + offset },
+                { x: corner.minX + offset, y: sInfo.baseY, z: corner.maxZ - offset },
+                { x: corner.maxX - offset, y: sInfo.baseY, z: corner.maxZ - offset },
+                
+                // 4 middle points at mid-height (base - 0.25)
+                { x: midX, y: sInfo.baseY - 0.25, z: corner.minZ + offset },
+                { x: midX, y: sInfo.baseY - 0.25, z: corner.maxZ - offset },
+                { x: corner.minX + offset, y: sInfo.baseY - 0.25, z: midZ },
+                { x: corner.maxX - offset, y: sInfo.baseY - 0.25, z: midZ }
             ];
             
-            // Cast rays downward to check for geometry
+            // Check each test point with raycasting
+            let hitCount = 0;
             for (const point of testPoints) {
                 raycaster.set(
-                    new THREE.Vector3(point.x, sInfo.baseY + 2, point.z),
+                    new THREE.Vector3(point.x, point.y + 2, point.z),
                     new THREE.Vector3(0, -1, 0)
                 );
                 
                 const intersects = raycaster.intersectObject(obj, true);
                 
-                // Check if any intersection is near the base level
+                // Check if there's geometry at this point
                 for (const hit of intersects) {
-                    if (Math.abs(hit.point.y - sInfo.baseY) < yTolerance) {
-                        cornerStatus[cornerName] = true;
+                    if (Math.abs(hit.point.y - point.y) < yTolerance) {
+                        hitCount++;
                         break;
                     }
                 }
-                
-                if (cornerStatus[cornerName]) break;
             }
+            
+            // Store hit counts
+            cornerHitCounts[cornerName] = hitCount;
+            cornerStatus[cornerName] = hitCount > 3;
+            
+            console.log(`  ${cornerName}: ${hitCount}/12 points hit`);
         });
         
-        console.log(`Rotation ${i * 90}°: SW=${cornerStatus.SW ? '■' : '□'}, SE=${cornerStatus.SE ? '■' : '□'}, NW=${cornerStatus.NW ? '■' : '□'}, NE=${cornerStatus.NE ? '■' : '□'}`);
+        console.log(`Rotation ${i * 90}°: Yellow=${cornerHitCounts.Yellow}/12, Red=${cornerHitCounts.Red}/12, Green=${cornerHitCounts.Green}/12, Blue=${cornerHitCounts.Blue}/12`);
         
-        // Best orientation is the one with SW corner empty and others filled
-        if (!cornerStatus.SW && (cornerStatus.SE || cornerStatus.NW || cornerStatus.NE)) {
+        // Calculate if this is a valid rotation (other corners not empty)
+        const otherCornersNotEmpty = cornerHitCounts.Red > 0 || cornerHitCounts.Green > 0 || cornerHitCounts.Blue > 0;
+        
+        rotationScores.push({
+            rotation: i,
+            yellowScore: cornerHitCounts.Yellow,
+            otherCornersNotEmpty: otherCornersNotEmpty,
+            allScores: {...cornerHitCounts}
+        });
+        
+        // Track the rotation with lowest Yellow score (as long as other corners aren't empty)
+        if (otherCornersNotEmpty && cornerHitCounts.Yellow < lowestYellowScore) {
+            lowestYellowScore = cornerHitCounts.Yellow;
             bestOrientation = i;
-            bestEmptySW = true;
-            break; // Found ideal orientation
+            bestEmptySW = cornerHitCounts.Yellow <= 3;  // Consider empty if 3 or fewer hits
         }
     }
+    
+    // Log the selection reasoning
+    console.log('\nRotation selection:');
+    rotationScores.forEach(r => {
+        const selected = r.rotation === bestOrientation ? ' <-- SELECTED' : '';
+        console.log(`  ${r.rotation * 90}°: Yellow=${r.yellowScore}/12, Others valid=${r.otherCornersNotEmpty}${selected}`);
+    });
     
     // Apply the best orientation
     const finalRotation = baseRotation + (bestOrientation * Math.PI / 2);
     obj.rotation.y = finalRotation;
     obj.updateMatrixWorld(true);
     
-    console.log(`Selected orientation: ${bestOrientation * 90}° rotation (SW corner ${bestEmptySW ? 'empty' : 'not ideal'})`);
+    console.log(`Selected orientation: ${bestOrientation * 90}° rotation (Yellow corner score: ${lowestYellowScore}/12)`);
     
     // Add a temporary visual indicator for the SW corner (at max X, max Z)
     const swIndicator = new THREE.Mesh(
