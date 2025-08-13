@@ -66,6 +66,113 @@ let foundationGroup = null; // temporary base shown in focus/capture
 let showFoundation = false;
 let treeMarkerGroup = null; // persistent tree when foundation toggle is on
 
+// --- Simple transform panel ---
+let transformPanel = null;
+let transformPanelObject = null;
+let isUpdatingFromPanel = false;
+
+function showTransformPanel(object) {
+    transformPanelObject = object;
+    if (!transformPanel) {
+        transformPanel = document.createElement('div');
+        transformPanel.id = 'transformPanel';
+        transformPanel.style.cssText = `position:fixed;top:120px;left:10px;background:#f6f6f6ee;color:#111;padding:10px 14px;border:1px solid #999;border-radius:4px;font:13px/1.4 sans-serif;z-index:9999;max-width:220px;`;
+        transformPanel.innerHTML = `
+            <h4 style="margin:0 0 8px 0;font-size:14px;">Transform</h4>
+            <div class="field">Pos X <input type="number" step="0.1" id="tx" style="width:60px"></div>
+            <div class="field">Pos Y <input type="number" step="0.1" id="ty" style="width:60px"></div>
+            <div class="field">Pos Z <input type="number" step="0.1" id="tz" style="width:60px"></div>
+            <hr/>
+            <div class="field">Rot X° <input type="number" step="1" id="rx" style="width:60px"></div>
+            <div class="field">Rot Y° <input type="number" step="1" id="ry" style="width:60px"></div>
+            <div class="field">Rot Z° <input type="number" step="1" id="rz" style="width:60px"></div>
+            <hr/>
+            <div class="field">Scale X <input type="number" step="0.01" id="sx" style="width:60px"></div>
+            <div class="field">Scale Y <input type="number" step="0.01" id="sy" style="width:60px"></div>
+            <div class="field">Scale Z <input type="number" step="0.01" id="sz" style="width:60px"></div>
+            <button id="fitBtn" style="margin-top:8px;padding:4px 8px;">Fit to Structure</button>
+        `;
+        document.body.appendChild(transformPanel);
+
+        ['tx','ty','tz','rx','ry','rz','sx','sy','sz'].forEach(id => {
+            const el = transformPanel.querySelector(`#${id}`);
+            el.addEventListener('input', ()=>{
+                if (!transformPanelObject) return;
+                isUpdatingFromPanel = true;
+                const o = transformPanelObject;
+                o.position.set(
+                    parseFloat(transformPanel.querySelector('#tx').value)||0,
+                    parseFloat(transformPanel.querySelector('#ty').value)||0,
+                    parseFloat(transformPanel.querySelector('#tz').value)||0
+                );
+                o.rotation.set(
+                    THREE.MathUtils.degToRad(parseFloat(transformPanel.querySelector('#rx').value)||0),
+                    THREE.MathUtils.degToRad(parseFloat(transformPanel.querySelector('#ry').value)||0),
+                    THREE.MathUtils.degToRad(parseFloat(transformPanel.querySelector('#rz').value)||0)
+                );
+                const uiScaleX = parseFloat(transformPanel.querySelector('#sx').value)||1;
+                const uiScaleY = parseFloat(transformPanel.querySelector('#sy').value)||1;
+                const uiScaleZ = parseFloat(transformPanel.querySelector('#sz').value)||1;
+                // Convert displayed scale (segment-units) to actual scale (world-units)
+                const realScaleX = uiScaleX / METERS_PER_SEGMENT;
+                const realScaleY = uiScaleY / METERS_PER_SEGMENT;
+                const realScaleZ = uiScaleZ / METERS_PER_SEGMENT;
+                o.scale.set(realScaleX, realScaleY, realScaleZ);
+                o.updateMatrixWorld();
+                isUpdatingFromPanel = false;
+            });
+        });
+        // Attach Fit button listener once
+        const fitBtn = transformPanel.querySelector('#fitBtn');
+        fitBtn.addEventListener('click', () => {
+            if (!transformPanelObject) return;
+            const obj = transformPanelObject;
+            // 1. Fixed rotation of -30° around Y
+            obj.rotation.y = THREE.MathUtils.degToRad(-30);
+
+            // 2. Uniform scale so that displayed segment-scale reads 2.0 ↔ world scale = 2.0 / METERS_PER_SEGMENT
+            const desiredSegScale = 2.0;
+            const worldScale = desiredSegScale / METERS_PER_SEGMENT;
+            obj.scale.set(worldScale, worldScale, worldScale);
+
+            obj.updateMatrixWorld(true);
+
+            // 3. Push down so bottom of model rests on structure ground plane (bounds.min.y)
+            const sid = obj.userData?.structureId ?? (focusedStructure && focusedStructure.id);
+            if (sid == null) { alert('No target structure to fit against'); return; }
+            const b = computeStructureBoundsById(sid);
+            if (!b) { alert('Could not compute structure bounds'); return; }
+            const box = new THREE.Box3().setFromObject(obj);
+            const deltaY = (b.min.y) - box.min.y;
+            obj.position.y += deltaY;
+            obj.updateMatrixWorld(true);
+            updateTransformPanel();
+        });
+    }
+    updateTransformPanel();
+}
+
+function updateTransformPanel() {
+    if (!transformPanel || !transformPanelObject || isUpdatingFromPanel) return;
+    const o = transformPanelObject;
+    transformPanel.querySelector('#tx').value = o.position.x.toFixed(2);
+    transformPanel.querySelector('#ty').value = o.position.y.toFixed(2);
+    transformPanel.querySelector('#tz').value = o.position.z.toFixed(2);
+    transformPanel.querySelector('#rx').value = (THREE.MathUtils.radToDeg(o.rotation.x)).toFixed(1);
+    transformPanel.querySelector('#ry').value = (THREE.MathUtils.radToDeg(o.rotation.y)).toFixed(1);
+    transformPanel.querySelector('#rz').value = (THREE.MathUtils.radToDeg(o.rotation.z)).toFixed(1);
+    transformPanel.querySelector('#sx').value = (o.scale.x * METERS_PER_SEGMENT).toFixed(2);
+    transformPanel.querySelector('#sy').value = (o.scale.y * METERS_PER_SEGMENT).toFixed(2);
+    transformPanel.querySelector('#sz').value = (o.scale.z * METERS_PER_SEGMENT).toFixed(2);
+}
+
+// Update panel continuously
+function animateTransformPanel() {
+    updateTransformPanel();
+    requestAnimationFrame(animateTransformPanel);
+}
+requestAnimationFrame(animateTransformPanel);
+
 function init() {
     if (!THREE) {
         console.error('THREE.js not loaded');
@@ -345,15 +452,29 @@ function setupEventListeners() {
     
     // Keyboard events
     window.addEventListener('keydown', (event) => {
-        if (isTypingIntoInput(event)) return; // ignore hotkeys while typing
+        // Disable ALL hotkeys when typing into an input, textarea, select, or content-editable
+        if (isTypingIntoInput(event)) return;
+
+        if (event.key === 'f' || event.key === 'F') {
+            event.preventDefault();
+            toggleFocusMode();
+            return;
+        }
+        if (event.key === ' ' || event.key === 'Spacebar') {
+            event.preventDefault();
+            clearSelection();
+            hideGizmos();
+            return;
+        }
+
+        // For the rest, respect typing context
+        if (isTypingIntoInput(event)) return;
+
         if (event.key === 'Shift') {
             shiftPressed = true;
             if (selectedVoxels.length > 0) {
                 createGizmos();
             }
-        } else if (event.key === 'f' || event.key === 'F') {
-            event.preventDefault();
-            toggleFocusMode();
         } else if (tripoTransformControls) {
             // W/E/R when transform controls are present
             if (event.key === 'w' || event.key === 'W') {
@@ -363,10 +484,6 @@ function setupEventListeners() {
             } else if (event.key === 'r' || event.key === 'R') {
                 tripoTransformControls.setMode('scale');
             }
-        } else if (event.key === ' ' || event.key === 'Spacebar') {
-            event.preventDefault();
-            clearSelection();
-            hideGizmos();
         } else if (event.key === 'Delete' || event.key === 'Backspace') {
             event.preventDefault();
             deleteSelectedVoxels();
@@ -2991,6 +3108,10 @@ async function sendImageToTripo(imageUrl) {
 }
 
 function attachTripoResult(glbUrl, previewUrl, sourceStructureId = null) {
+    // If a card with this GLB already exists, do not add another
+    const dup = document.querySelector(`.capture-item[data-type="tripo"][data-glb="${glbUrl}"]`);
+    if (dup) return dup;
+
     const gallery = document.getElementById('captureGallery');
     const item = document.createElement('div');
     item.className = 'capture-item';
@@ -3120,207 +3241,45 @@ async function initTripoViewer(container, glbUrl) {
 }
 
 async function enableTripoPlacement(glbUrl, structureId = null) {
-    // Check if this specific structure already has a model
+    // If already placed for this structure, do nothing
     if (structureId && placedModelsByStructure.has(structureId)) {
         console.log(`Structure ${structureId} already has a model placed`);
         return;
     }
+    // Load GLB (cached if possible)
     const gltfRoot = await loadGLTFRoot(glbUrl);
     cachedTripoGLB = gltfRoot;
-    // Compute placement bounds: prefer focused structure; else selected; else all voxels; else origin box
-    const bounds = structureId ? computeStructureBoundsById(structureId) : computePlacementBounds();
-    
-    // The actual size of the structure in world units
-    // Since voxels are 1x1x1 and positioned at integer coordinates,
-    // the size is the difference between max and min bounds
-    const structureSize = new THREE.Vector3(
-        bounds.max.x - bounds.min.x,
-        bounds.max.y - bounds.min.y,
-        bounds.max.z - bounds.min.z
-    );
-    
-    // The center of the structure bounds
-    const targetCenter = new THREE.Vector3().addVectors(bounds.min, bounds.max).multiplyScalar(0.5);
-    
-    // Removed placement debug logging
-
-    // Reset transforms before analysis
-    gltfRoot.rotation.set(0, 0, 0);
-    gltfRoot.scale.set(1, 1, 1);
-    gltfRoot.position.set(0, 0, 0);
-    gltfRoot.updateMatrixWorld(true);
-
-    // Convert Tripo metres into Buildify segments (1 seg = METERS_PER_SEGMENT m)
+ 
+    // Basic import: convert metres->segments and drop pivot at origin
     gltfRoot.scale.multiplyScalar(1 / METERS_PER_SEGMENT);
-
-    // Center root at origin for analysis
-    const box = new THREE.Box3().setFromObject(gltfRoot);
-    const size = box.getSize(new THREE.Vector3());
-
-    // Compute model bbox at its native scale
-    const modelBox = new THREE.Box3().setFromObject(gltfRoot);
-    const modelSize = modelBox.getSize(new THREE.Vector3());
-    const modelCenter = modelBox.getCenter(new THREE.Vector3());
-
-    // Move pivot to origin for stable sizing
-    gltfRoot.position.sub(modelCenter);
     gltfRoot.updateMatrixWorld(true);
-
-    // Get model size at origin
-    let modelBoxAtOrigin = new THREE.Box3().setFromObject(gltfRoot);
-    let modelSizeAtOrigin = modelBoxAtOrigin.getSize(new THREE.Vector3());
-    
-    // Compute target size including inclusive bounds (+1)
-    const targetSize = new THREE.Vector3(
-        structureSize.x + 1,
-        structureSize.y + 1,
-        structureSize.z + 1
-    );
-
-    // First try PCA-based upright orientation and footprint mapping
-    let appliedRotation = false;
-    const pca = computePCAAxesAndExtents(gltfRoot);
-    if (pca && pca.axes && pca.sizes) {
-        const axes = pca.axes; // three orthonormal directions in world space
-        const sizes = pca.sizes; // extents along these axes
-        // Choose the axis with the largest size to map to +Y (upright)
-        const idxY = (sizes.y >= sizes.x && sizes.y >= sizes.z) ? 1 : (sizes.x >= sizes.z ? 0 : 2);
-        // Remaining indices for footprint mapping
-        const rem = [0,1,2].filter(i => i !== idxY);
-        const idxA = rem[0], idxB = rem[1];
-        const candidates = [];
-        const makeCandidate = (idxX, signX) => {
-            // Up axis ey should point upwards
-            const eyBase = axes[idxY].clone();
-            const ey = (eyBase.y < 0 ? eyBase.clone().negate() : eyBase.clone());
-            const exBase = axes[idxX].clone().multiplyScalar(signX);
-            // ez forms right-handed basis
-            let ez = new THREE.Vector3().crossVectors(exBase, ey).normalize();
-            // If degenerate due to near-colinearity, skip
-            if (ez.lengthSq() < 0.9) return;
-            const ex = exBase.clone().normalize();
-            // Determine which pca size maps to ex/ez for footprint
-            const sizeX = sizes.getComponent(idxX);
-            const idxZ = [0,1,2].find(i => i !== idxY && i !== idxX);
-            const sizeZ = sizes.getComponent(idxZ);
-            // Solve LS uniform scale for footprint
-            const tx = targetSize.x, tz = targetSize.z;
-            const mx = Math.max(1e-6, sizeX), mz = Math.max(1e-6, sizeZ);
-            const denom = mx*mx + mz*mz;
-            const s = denom > 1e-9 ? (tx*mx + tz*mz) / denom : 1;
-            const rx = s*mx - tx; const rz = s*mz - tz;
-            const cost = rx*rx + rz*rz;
-            // Prefer ex to point generally towards +X to reduce unnecessary 180° flips when tied
-            const tieBias = 1 - Math.max(0, ex.dot(new THREE.Vector3(1,0,0))); // 0 if aligned with +X
-            candidates.push({ ex, ey, ez, s, cost: cost + 1e-3 * tieBias });
-        };
-        // Two permutations for footprint axis to X (A->X or B->X), try both signs for ex
-        makeCandidate(idxA, +1); makeCandidate(idxA, -1);
-        makeCandidate(idxB, +1); makeCandidate(idxB, -1);
-        if (candidates.length > 0) {
-            candidates.sort((a,b) => a.cost - b.cost);
-            const best = candidates[0];
-            // Build basis from chosen ex,ey,ez and compute rotation R = D * S^T (with D=identity)
-            const S = new THREE.Matrix4().makeBasis(best.ex, best.ey, best.ez);
-            const R = new THREE.Matrix4().copy(S).transpose();
-            gltfRoot.setRotationFromMatrix(R);
-            gltfRoot.updateMatrixWorld(true);
-            // After rotation, recompute actual box dimensions
-            const rotatedBox = new THREE.Box3().setFromObject(gltfRoot);
-            const rotatedSize = rotatedBox.getSize(new THREE.Vector3());
-            // Weighted least-squares uniform scale including height (favor footprint)
-            const wX = 4, wZ = 4, wY = 1;
-            const mx = Math.max(1e-6, rotatedSize.x);
-            const my = Math.max(1e-6, rotatedSize.y);
-            const mz = Math.max(1e-6, rotatedSize.z);
-            const tx = targetSize.x, ty = targetSize.y, tz = targetSize.z;
-            const denom = wX*mx*mx + wY*my*my + wZ*mz*mz;
-            const s = denom > 1e-9 ? (wX*tx*mx + wY*ty*my + wZ*tz*mz) / denom : 1;
-            gltfRoot.scale.setScalar(s);
-            gltfRoot.updateMatrixWorld(true);
-            appliedRotation = true;
-        }
+ 
+    // Choose initial position – center of target structure if provided, else (0,0,0)
+    let startPos = new THREE.Vector3(0, 0, 0);
+    if (structureId) {
+        const b = computeStructureBoundsById(structureId);
+        if (b) startPos.addVectors(b.min, b.max).multiplyScalar(0.5);
     }
-
-    // Fallback: search yaw-only cardinal rotations with LS footprint scale
-    if (!appliedRotation) {
-        const yawCandidates = [0, 90, 180, 270];
-        let bestYawRad = 0;
-        let bestScale = 1;
-        let bestCost = Infinity;
-        const tx = targetSize.x, tz = targetSize.z;
-        for (const deg of yawCandidates) {
-            const rad = deg * Math.PI / 180;
-            gltfRoot.rotation.set(0, rad, 0);
-            gltfRoot.updateMatrixWorld(true);
-            const testBox = new THREE.Box3().setFromObject(gltfRoot);
-            const testSize = testBox.getSize(new THREE.Vector3());
-            const mx = Math.max(1e-6, testSize.x);
-            const mz = Math.max(1e-6, testSize.z);
-            const denom = mx*mx + mz*mz;
-            const s = denom > 1e-9 ? (tx*mx + tz*mz) / denom : 1;
-            const rx = s*mx - tx;
-            const rz = s*mz - tz;
-            const cost = rx*rx + rz*rz;
-            const preferNoRotation = (Math.abs(cost - bestCost) < 0.01*(tx+tz) && deg === 0);
-            if (cost < bestCost || preferNoRotation) {
-                bestCost = cost;
-                bestYawRad = rad;
-                bestScale = s;
-            }
-        }
-        gltfRoot.rotation.set(0, bestYawRad, 0);
-        gltfRoot.scale.setScalar(bestScale);
-        gltfRoot.updateMatrixWorld(true);
+    gltfRoot.position.copy(startPos);
+ 
+    // Add anchor / pivot visual helper
+    const anchorHelper = new THREE.AxesHelper(1.5 * voxelSize);
+    anchorHelper.name = 'anchorHelper';
+    gltfRoot.add(anchorHelper);
+ 
+    scene.add(gltfRoot);
+ 
+    // Attach interactive gizmos + numeric panel
+    await attachTripoTransformControls(gltfRoot);
+    showTransformPanel(gltfRoot);
+ 
+    tripoModelGroup = gltfRoot;
+    tripoPlacementEnabled = true;
+    if (structureId) {
+        placedModelsByStructure.set(structureId, { group: gltfRoot, glbUrl });
     }
-
-    // Get the final bounding box after scaling
-    const scaledBox = new THREE.Box3().setFromObject(gltfRoot);
-    
-    // Position the model so it sits on the grid at the structure's position
-    // Align the bottom of the model with the bottom of the structure
-    const yOffset = bounds.min.y - scaledBox.min.y;
-    
-    const finalPosition = new THREE.Vector3(
-        targetCenter.x,
-        yOffset,
-        targetCenter.z
-    );
-    
-    gltfRoot.position.copy(finalPosition);
-    
-    // Log summary
-    const yawDeg = (gltfRoot.rotation.y * 180 / Math.PI).toFixed(0);
-    const scaleApplied = gltfRoot.scale.x.toFixed(3);
-    console.log(`Placement -> yaw ${yawDeg}°, scale ${scaleApplied}, position (${gltfRoot.position.x.toFixed(1)}, ${gltfRoot.position.y.toFixed(1)}, ${gltfRoot.position.z.toFixed(1)})`);
-
-    const modelGroup = new THREE.Group();
-    modelGroup.userData.isTripoModel = true;
-    modelGroup.userData.structureId = structureId;
-    modelGroup.add(gltfRoot);
-    scene.add(modelGroup);
-    
-    // Store the model in the tracking map
-    placedModelsByStructure.set(structureId, {
-        group: modelGroup,
-        glbUrl: glbUrl
-    });
-    
-    // Set as active model if this is for the focused structure
-    if (focusedStructure && structureId === focusedStructure.id) {
-        tripoModelGroup = modelGroup;
-        tripoPlacementEnabled = true;
-        
-        // Show transform controls in focus mode
-        if (focusMode) {
-            await attachTripoTransformControls(tripoModelGroup);
-        }
-    }
-    
-    // Update focus mode visibility if active
-    if (focusMode) {
-        updateFocusModeVisibility();
-    }
+    persistStateIfEnabled?.();
+    return; // Skip legacy automatic placement logic
 }
 
 function chooseBestAxisAlignedRotation(modelSize, targetSize) {
@@ -3478,6 +3437,10 @@ function computePlacementBounds() {
 }
 
 function addLocalGlbCard(glbUrl, onCleanup) {
+    // Skip if card for this GLB already exists
+    const existing = document.querySelector(`.capture-item[data-glb="${glbUrl}"]`);
+    if (existing) return existing;
+
     const gallery = document.getElementById('captureGallery');
     const item = document.createElement('div');
     item.className = 'capture-item';
@@ -3671,16 +3634,30 @@ async function attachTripoTransformControls(target) {
             });
         }
     }
+
+    // Show numeric panel for this target
+    showTransformPanel(target);
 }
 
 function detachTripoTransformControls() {
-    if (!tripoTransformControls) return;
-    tripoTransformControls.detach();
-    scene.remove(tripoTransformControls);
-    tripoTransformControls.dispose?.();
-    tripoTransformControls = null;
+    // Detach and dispose controls if present
+    if (tripoTransformControls) {
+        tripoTransformControls.detach();
+        scene.remove(tripoTransformControls);
+        tripoTransformControls.dispose?.();
+        tripoTransformControls = null;
+    }
+
+    // Hide any HUD
     const hud = document.getElementById('transformHud');
     if (hud) hud.style.display = 'none';
+
+    // Always remove numeric transform panel (even if controls were already gone)
+    if (transformPanel) {
+        transformPanel.remove();
+        transformPanel = null;
+        transformPanelObject = null;
+    }
 }
 
 
@@ -4425,13 +4402,17 @@ function snapshotGalleryState() {
     const gallery = document.getElementById('captureGallery');
     if (!gallery) return [];
     const out = [];
+    const seenGlbs = new Set();
     gallery.querySelectorAll('.capture-item').forEach(item => {
         const type = item.dataset.type || 'image';
         const label = (item.querySelector('.capture-label')?.textContent || '').trim();
         const img = item.querySelector('img.capture-img');
         const structureId = item.dataset.structureId ? Number(item.dataset.structureId) : undefined;
         if (type === 'tripo' || type === 'localglb') {
-            out.push({ type: 'tripo', glb: item.dataset.glb || '', structureId });
+            const glbUrl = item.dataset.glb || '';
+            if (seenGlbs.has(glbUrl)) return; // skip duplicate GLB entries
+            seenGlbs.add(glbUrl);
+            out.push({ type: 'tripo', glb: glbUrl, structureId });
         } else if (img) {
             out.push({ type: type === 'flux' ? 'flux' : 'image', src: img.src, label, structureId });
         }
@@ -4467,10 +4448,14 @@ function restorePersistentState() {
             placedModelsByStructure = new Map();
             // Process models asynchronously without blocking the main restoration
             Object.keys(state.placedModelsData).forEach((structureId) => {
+                const sid = Number(structureId);
+                // Skip if the associated structure was not restored (or no structures exist)
+                if (!savedStructures || !savedStructures.some(s => s.id === sid)) return;
+
                 const modelData = state.placedModelsData[structureId];
                 if (modelData && modelData.glbUrl) {
                     // Re-place the model for this structure (async but don't block)
-                    enableTripoPlacement(modelData.glbUrl, Number(structureId)).catch(e => {
+                    enableTripoPlacement(modelData.glbUrl, sid).catch(e => {
                         console.warn(`Failed to restore model for structure ${structureId}:`, e);
                     });
                 }
@@ -5385,3 +5370,26 @@ function createOrUpdateTreeMarker(boundsOverride = null, camForPlacement = null)
     // independent of the user's current scene camera orientation.
     positionTreeMarker(bounds, camForPlacement || camIso);
 }
+
+// Fit button
+transformPanel.querySelector('#fitBtn').addEventListener('click', () => {
+    if (!transformPanelObject) return;
+    const obj = transformPanelObject;
+    // Determine which structure to fit against: prefer the object's userData.structureId, else current focused
+    const sid = obj.userData?.structureId ?? (focusedStructure && focusedStructure.id);
+    if (sid == null) { alert('No target structure to fit against'); return; }
+    const b = computeStructureBoundsById(sid);
+    if (!b) { alert('Could not compute bounds for structure'); return; }
+    const targetSize = new THREE.Vector3(b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z);
+
+    // Current model size
+    const box = new THREE.Box3().setFromObject(obj);
+    const curSize = box.getSize(new THREE.Vector3());
+    if (curSize.x < 1e-3 || curSize.z < 1e-3) { alert('Model size is zero'); return; }
+
+    // Uniform scale to match X/Z footprint (average)
+    const s = 0.5 * ((targetSize.x / curSize.x) + (targetSize.z / curSize.z));
+    obj.scale.multiplyScalar(s);
+    obj.updateMatrixWorld(true);
+    updateTransformPanel();
+});
