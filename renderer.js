@@ -5252,3 +5252,158 @@ transformPanel.querySelector('#fitBtn').addEventListener('click', () => {
     obj.updateMatrixWorld(true);
     updateTransformPanel();
 });
+
+function buildStructureFoundationCells(sInfo) {
+    // Return Set of "x|z" cells occupied by the structure foundation idealization
+    const cells = new Set();
+    for (let x = sInfo.rMinX; x <= sInfo.rMaxX; x++) {
+        for (let z = sInfo.rMinZ; z <= sInfo.rMaxZ; z++) {
+            if (x === sInfo.missing.x && z === sInfo.missing.z) continue;
+            cells.add(`${x}|${z}`);
+        }
+    }
+    return cells;
+}
+
+function computeYawAndScaleFromEdges(missingModel, boundsModel, sInfo) {
+    // Build model edge vectors from the missing corner to its two adjacent corners
+    const mm = new THREE.Vector2(missingModel.x, missingModel.z);
+    const bm = boundsModel;
+    const adjZ = (missingModel.z === bm.minZ ? bm.maxZ : bm.minZ);
+    const adjX = (missingModel.x === bm.minX ? bm.maxX : bm.minX);
+    const vA = new THREE.Vector2(missingModel.x, adjZ).sub(mm); // constant X edge
+    const vB = new THREE.Vector2(adjX, missingModel.z).sub(mm); // constant Z edge
+    if (vA.lengthSq() < 1e-8 || vB.lengthSq() < 1e-8) return null;
+
+    // Target edges from NE missing corner: down (to minZ) and left (to minX)
+    const mt = new THREE.Vector2(sInfo.missing.x, sInfo.missing.z);
+    const tDown = new THREE.Vector2(sInfo.missing.x, sInfo.rMinZ).sub(mt);
+    const tLeft = new THREE.Vector2(sInfo.rMinX, sInfo.missing.z).sub(mt);
+
+    const solveTheta = (src1, src2, dst1, dst2) => {
+        // 2D Procrustes rotation: theta = atan2(sum v x t, sum v · t)
+        const s = (src1.x * dst1.y - src1.y * dst1.x) + (src2.x * dst2.y - src2.y * dst2.x);
+        const c = (src1.x * dst1.x + src1.y * dst1.y) + (src2.x * dst2.x + src2.y * dst2.y);
+        return Math.atan2(s, c);
+    };
+    const mappingA = { theta: solveTheta(vA, vB, tDown, tLeft) };
+    const mappingB = { theta: solveTheta(vA, vB, tLeft, tDown) };
+
+    const scoreFor = (theta, src1, src2, dst1, dst2) => {
+        const R = (v) => new THREE.Vector2(
+            Math.cos(theta) * v.x - Math.sin(theta) * v.y,
+            Math.sin(theta) * v.x + Math.cos(theta) * v.y
+        );
+        const e1 = R(src1).sub(dst1).lengthSq();
+        const e2 = R(src2).sub(dst2).lengthSq();
+        return e1 + e2;
+    };
+    const errA = scoreFor(mappingA.theta, vA, vB, tDown, tLeft);
+    const errB = scoreFor(mappingB.theta, vA, vB, tLeft, tDown);
+    const theta = errA <= errB ? mappingA.theta : mappingB.theta;
+
+    return { theta };
+}
+
+function detectModelFoundationMissingCell(root, yEpsilon = 0.2) {
+    // Sample vertices near the model's lowest Y to detect base occupancy in XZ; returns { missingX, missingZ, bounds }
+    const pos = new THREE.Vector3();
+    let minY = Infinity;
+    const worldVerts = [];
+    root.updateMatrixWorld(true);
+    root.traverse(n => {
+        if (!n.isMesh || !n.geometry || !n.geometry.attributes || !n.geometry.attributes.position) return;
+        const attr = n.geometry.attributes.position;
+        for (let i = 0; i < attr.count; i++) {
+            pos.fromBufferAttribute(attr, i).applyMatrix4(n.matrixWorld);
+            worldVerts.push(pos.clone());
+            if (pos.y < minY) minY = pos.y;
+        }
+    });
+    if (!isFinite(minY) || worldVerts.length === 0) return null;
+ 
+    const eps = Math.max(0.05 * voxelSize, yEpsilon * voxelSize);
+    const occ = new Set();
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    worldVerts.forEach(p => {
+        if (p.y <= minY + eps) {
+            const gx = Math.round(p.x);
+            const gz = Math.round(p.z);
+            occ.add(`${gx}|${gz}`);
+            if (gx < minX) minX = gx;
+            if (gx > maxX) maxX = gx;
+            if (gz < minZ) minZ = gz;
+            if (gz > maxZ) maxZ = gz;
+        }
+    });
+    if (!isFinite(minX) || !occ.size) return null;
+ 
+    const corners = [
+        { x: minX, z: minZ },
+        { x: minX, z: maxZ },
+        { x: maxX, z: minZ },
+        { x: maxX, z: maxZ }
+    ];
+    const has = (x, z) => occ.has(`${x}|${z}`);
+    let missing = corners.find(c => !has(c.x, c.z));
+    if (!missing) {
+        // Tie-breaker: pick the corner with least local occupancy in a 2x2 patch
+        const localCount = (cx, cz) => {
+            let count = 0;
+            for (let dx = 0; dx <= 1; dx++) for (let dz = 0; dz <= 1; dz++) {
+                if (has(cx - dx, cz - dz)) count++;
+            }
+            return count;
+        };
+        let best = { corner: corners[0], score: Infinity };
+        for (const c of corners) {
+            const score = localCount(c.x, c.z);
+            if (score < best.score) best = { corner: c, score };
+        }
+        missing = best.corner;
+    }
+    return { missingX: missing.x, missingZ: missing.z, bounds: { minX, maxX, minZ, maxZ }, occupancy: occ };
+}
+
+function autoAlignModelToStructureFoundation(obj, structureId, { baseRotationDeg = -32.5 } = {}) {
+    const sInfo = computeStructureFoundationInfo(structureId);
+    if (!sInfo) { showToast?.('Could not compute structure foundation', 'error'); return; }
+    const original = { pos: obj.position.clone(), rot: obj.rotation.clone(), scl: obj.scale.clone() };
+
+    // Detect current model base and compute precise yaw/scale from edges
+    let mInfo0 = detectModelFoundationMissingCell(obj);
+    if (!mInfo0) { showToast?.('Could not detect model foundation', 'error'); return; }
+    const ms = { x: mInfo0.missingX, z: mInfo0.missingZ };
+    const params = computeYawAndScaleFromEdges(ms, mInfo0.bounds, sInfo);
+    if (!params) { showToast?.('Alignment failed (degenerate edges)', 'error'); return; }
+
+    // Apply rotation and scale
+    obj.rotation.y = params.theta;
+    obj.scale.copy(original.scl);
+    obj.updateMatrixWorld(true);
+
+    // Compute uniform scale to match structure footprint after rotation
+    const structW = (sInfo.rMaxX - sInfo.rMinX + 1);
+    const structD = (sInfo.rMaxZ - sInfo.rMinZ + 1);
+    const boxAfterRot = new THREE.Box3().setFromObject(obj);
+    const sizeAfterRot = boxAfterRot.getSize(new THREE.Vector3());
+    const modelW = Math.max(1e-6, sizeAfterRot.x);
+    const modelD = Math.max(1e-6, sizeAfterRot.z);
+    const scaleW = structW / modelW;
+    const scaleD = structD / modelD;
+    const uniformScale = Math.max(1e-3, 0.5 * (scaleW + scaleD));
+    obj.scale.multiplyScalar(uniformScale);
+    obj.updateMatrixWorld(true);
+
+    // Snap missing corner to NE and rest on base
+    const mInfo1 = detectModelFoundationMissingCell(obj);
+    if (mInfo1) {
+        obj.position.x += (sInfo.missing.x - mInfo1.missingX);
+        obj.position.z += (sInfo.missing.z - mInfo1.missingZ);
+    }
+    const box = new THREE.Box3().setFromObject(obj);
+    obj.position.y += (sInfo.baseY - box.min.y);
+    obj.updateMatrixWorld(true);
+
+    showToast?.('Auto-aligned to foundation', 'success');
+}
