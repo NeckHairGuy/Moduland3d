@@ -5527,13 +5527,12 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
     const oldDebug = scene.getObjectByName('alignmentDebugLine');
     if (oldDebug) scene.remove(oldDebug);
 
-    // Find the rotation that best aligns the model's edges with X/Z axes
+    // Find the rotation that best aligns the model's BOUNDING BOX edges with X/Z axes
     let bestRotation = 0;
     let bestAlignmentScore = Infinity;
     let bestAlignedAxis = 'X'; // Track which axis we're aligning to
-    let bestEdgePoints = []; // Store the edge points for visualization
     
-    // Test rotations from -90 to 90 degrees (models shouldn't need more than this)
+    // Test rotations from -90 to 90 degrees
     for (let angleDeg = -90; angleDeg <= 90; angleDeg += 5) {
         const angleRad = angleDeg * Math.PI / 180;
         
@@ -5543,47 +5542,26 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
         
         // Get the model's bounding box at this rotation
         const box = new THREE.Box3().setFromObject(obj);
+        const size = box.getSize(new THREE.Vector3());
         
-        // Sample points along the bottom of the model to detect edges
-        const samples = [];
-        const numSamples = 50; // Increased for better edge detection
+        // The bounding box is always axis-aligned, so we check how "square" it is
+        // A perfectly aligned rectangular model will have a bounding box with sides parallel to axes
+        // We want to minimize the difference between the model's oriented bounding box and axis-aligned box
         
-        obj.traverse((child) => {
-            if (child.isMesh && child.geometry) {
-                const positions = child.geometry.attributes.position;
-                if (positions) {
-                    for (let i = 0; i < positions.count && samples.length < numSamples; i++) {
-                        const vertex = new THREE.Vector3();
-                        vertex.fromBufferAttribute(positions, i);
-                        vertex.applyMatrix4(child.matrixWorld);
-                        
-                        // Only sample points near the bottom
-                        if (Math.abs(vertex.y - box.min.y) < 0.5) {
-                            samples.push({ x: vertex.x, z: vertex.z, y: vertex.y });
-                        }
-                    }
-                }
-            }
-        });
+        // Simple approach: find rotation where bounding box has maximum area
+        // (bounding box is smallest when edges align with axes)
+        const boxArea = size.x * size.z;
         
-        if (samples.length < 4) continue;
+        // Or use aspect ratio - when aligned, one dimension should be notably larger
+        const aspectRatio = Math.max(size.x / size.z, size.z / size.x);
         
-        // Check alignment with X axis (variance in Z should be minimal for aligned edges)
-        const xAlignedPoints = samples.map(p => p.z);
-        const zVariance = calculateVariance(xAlignedPoints);
-        
-        // Check alignment with Z axis (variance in X should be minimal for aligned edges)
-        const zAlignedPoints = samples.map(p => p.x);
-        const xVariance = calculateVariance(zAlignedPoints);
-        
-        // Best alignment has minimum variance perpendicular to axes
-        const alignmentScore = Math.min(xVariance, zVariance);
+        // Score based on compactness - lower is better
+        const alignmentScore = boxArea / aspectRatio;
         
         if (alignmentScore < bestAlignmentScore) {
             bestAlignmentScore = alignmentScore;
             bestRotation = angleRad;
-            bestAlignedAxis = xVariance < zVariance ? 'Z' : 'X';
-            bestEdgePoints = [...samples]; // Store the samples for this rotation
+            bestAlignedAxis = size.x > size.z ? 'X' : 'Z';
         }
     }
     
@@ -5597,39 +5575,16 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
         obj.updateMatrixWorld(true);
         
         const box = new THREE.Box3().setFromObject(obj);
-        const samples = [];
-        const numSamples = 50;
+        const size = box.getSize(new THREE.Vector3());
         
-        obj.traverse((child) => {
-            if (child.isMesh && child.geometry) {
-                const positions = child.geometry.attributes.position;
-                if (positions) {
-                    for (let i = 0; i < positions.count && samples.length < numSamples; i++) {
-                        const vertex = new THREE.Vector3();
-                        vertex.fromBufferAttribute(positions, i);
-                        vertex.applyMatrix4(child.matrixWorld);
-                        
-                        if (Math.abs(vertex.y - box.min.y) < 0.5) {
-                            samples.push({ x: vertex.x, z: vertex.z, y: vertex.y });
-                        }
-                    }
-                }
-            }
-        });
-        
-        if (samples.length < 4) continue;
-        
-        const xAlignedPoints = samples.map(p => p.z);
-        const zVariance = calculateVariance(xAlignedPoints);
-        const zAlignedPoints = samples.map(p => p.x);
-        const xVariance = calculateVariance(zAlignedPoints);
-        const alignmentScore = Math.min(xVariance, zVariance);
+        const boxArea = size.x * size.z;
+        const aspectRatio = Math.max(size.x / size.z, size.z / size.x);
+        const alignmentScore = boxArea / aspectRatio;
         
         if (alignmentScore < bestAlignmentScore) {
             bestAlignmentScore = alignmentScore;
             bestRotation = angleRad;
-            bestAlignedAxis = xVariance < zVariance ? 'Z' : 'X';
-            bestEdgePoints = [...samples];
+            bestAlignedAxis = size.x > size.z ? 'X' : 'Z';
         }
     }
     
@@ -5640,295 +5595,153 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
     obj.rotation.y = bestRotation;
     obj.updateMatrixWorld(true);
     
-    // Do a final pass to verify and correct any small misalignment
-    // Sample the current position after best rotation
-    const finalBox = new THREE.Box3().setFromObject(obj);
-    const finalSamples = [];
+    // No need for additional edge detection - bounding box approach is sufficient
     
-    obj.traverse((child) => {
-        if (child.isMesh && child.geometry) {
-            const positions = child.geometry.attributes.position;
-            if (positions) {
-                for (let i = 0; i < positions.count && finalSamples.length < 100; i++) {
-                    const vertex = new THREE.Vector3();
-                    vertex.fromBufferAttribute(positions, i);
-                    vertex.applyMatrix4(child.matrixWorld);
-                    
-                    if (Math.abs(vertex.y - finalBox.min.y) < 0.5) {
-                        finalSamples.push({ x: vertex.x, z: vertex.z, y: vertex.y });
-                    }
-                }
-            }
-        }
+    // Visualize the BOUNDING BOX edge with a red line
+    const visualBox = new THREE.Box3().setFromObject(obj);
+    const boxMin = visualBox.min;
+    const boxMax = visualBox.max;
+    
+    // Determine which edge of the bounding box to show based on alignment
+    let points;
+    if (bestAlignedAxis === 'X') {
+        // Show the edge that runs along X axis (at min Z)
+        points = [
+            new THREE.Vector3(boxMin.x, boxMin.y, boxMin.z),
+            new THREE.Vector3(boxMax.x, boxMin.y, boxMin.z)
+        ];
+    } else {
+        // Show the edge that runs along Z axis (at min X)  
+        points = [
+            new THREE.Vector3(boxMin.x, boxMin.y, boxMin.z),
+            new THREE.Vector3(boxMin.x, boxMin.y, boxMax.z)
+        ];
+    }
+    
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+    const material = new THREE.LineBasicMaterial({ 
+        color: 0xff0000, 
+        linewidth: 3,
+        depthTest: false,
+        depthWrite: false
+    });
+    const line = new THREE.Line(geometry, material);
+    line.name = 'alignmentDebugLine';
+    scene.add(line);
+    
+    // Also add spheres at the endpoints for clarity
+    const sphereGeometry = new THREE.SphereGeometry(0.2, 16, 16);
+    const sphereMaterial = new THREE.MeshBasicMaterial({ 
+        color: 0xff0000,
+        depthTest: false,
+        depthWrite: false
     });
     
-    // Find the most prominent edge and align it perfectly
-    if (finalSamples.length > 10) {
-        // Find the bounding box of the samples
-        const xMin = Math.min(...finalSamples.map(p => p.x));
-        const xMax = Math.max(...finalSamples.map(p => p.x));
-        const zMin = Math.min(...finalSamples.map(p => p.z));
-        const zMax = Math.max(...finalSamples.map(p => p.z));
-        
-        const xRange = xMax - xMin;
-        const zRange = zMax - zMin;
-        
-        // Find the two most extreme points to define the main edge
-        let edgeStart, edgeEnd;
-        
-        if (xRange > zRange) {
-            // Edge runs mostly along X - find leftmost and rightmost points
-            finalSamples.sort((a, b) => a.x - b.x);
-            edgeStart = finalSamples[0];
-            edgeEnd = finalSamples[finalSamples.length - 1];
-            bestAlignedAxis = 'X';
-        } else {
-            // Edge runs mostly along Z - find frontmost and backmost points
-            finalSamples.sort((a, b) => a.z - b.z);
-            edgeStart = finalSamples[0];
-            edgeEnd = finalSamples[finalSamples.length - 1];
-            bestAlignedAxis = 'Z';
-        }
-        
-        // Calculate the angle of this edge in the XZ plane
-        const dx = edgeEnd.x - edgeStart.x;
-        const dz = edgeEnd.z - edgeStart.z;
-        const currentAngle = Math.atan2(dz, dx);
-        
-        // Calculate how much to rotate to align with the target axis
-        let targetAngle;
-        if (bestAlignedAxis === 'X') {
-            // We want the edge to be at 0° (along positive X) or 180° (along negative X)
-            // Choose the closest one
-            if (Math.abs(currentAngle) < Math.PI / 2) {
-                targetAngle = 0; // Align with positive X
-            } else {
-                targetAngle = Math.PI; // Align with negative X
-            }
-        } else {
-            // We want the edge to be at 90° (along positive Z) or -90° (along negative Z)
-            if (currentAngle > 0) {
-                targetAngle = Math.PI / 2; // Align with positive Z
-            } else {
-                targetAngle = -Math.PI / 2; // Align with negative Z
-            }
-        }
-        
-        const rotationCorrection = targetAngle - currentAngle;
-        
-        console.log('Edge detection:', {
-            currentAngle: currentAngle * 180 / Math.PI,
-            targetAngle: targetAngle * 180 / Math.PI,
-            correction: rotationCorrection * 180 / Math.PI,
-            axis: bestAlignedAxis
-        });
-        
-        // Apply the rotation correction
-        if (Math.abs(rotationCorrection) > Math.PI / 720) { // More than 0.25 degrees
-            console.log('Applying rotation correction:', rotationCorrection * 180 / Math.PI, 'degrees');
-            obj.rotation.y += rotationCorrection;
-            obj.updateMatrixWorld(true);
-        }
+    const sphere1 = new THREE.Mesh(sphereGeometry, sphereMaterial);
+    sphere1.position.copy(points[0]);
+    line.add(sphere1);
+    
+    const sphere2 = new THREE.Mesh(sphereGeometry, sphereMaterial);
+    sphere2.position.copy(points[1]);
+    line.add(sphere2);
+    
+    // Add reference axis lines to show what we're aligning to
+    const axisGroup = new THREE.Group();
+    axisGroup.name = 'axisDebugLines';
+    
+    // X-axis line (green)
+    const xAxisGeometry = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(boxMin.x - 2, boxMin.y, boxMin.z),
+        new THREE.Vector3(boxMax.x + 2, boxMin.y, boxMin.z)
+    ]);
+    const xAxisMaterial = new THREE.LineBasicMaterial({ 
+        color: 0x00ff00, 
+        linewidth: 2,
+        depthTest: false,
+        depthWrite: false
+    });
+    const xAxisLine = new THREE.Line(xAxisGeometry, xAxisMaterial);
+    axisGroup.add(xAxisLine);
+    
+    // Z-axis line (blue)
+    const zAxisGeometry = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(boxMin.x, boxMin.y, boxMin.z - 2),
+        new THREE.Vector3(boxMin.x, boxMin.y, boxMax.z + 2)
+    ]);
+    const zAxisMaterial = new THREE.LineBasicMaterial({ 
+        color: 0x0000ff, 
+        linewidth: 2,
+        depthTest: false,
+        depthWrite: false
+    });
+    const zAxisLine = new THREE.Line(zAxisGeometry, zAxisMaterial);
+    axisGroup.add(zAxisLine);
+    
+    scene.add(axisGroup);
+    
+    // Calculate angle between bounding box edge and axis
+    const edgeDx = points[1].x - points[0].x;
+    const edgeDz = points[1].z - points[0].z;
+    const edgeAngle = Math.atan2(edgeDz, edgeDx) * 180 / Math.PI;
+    
+    let angleFromAxis;
+    if (bestAlignedAxis === 'X') {
+        angleFromAxis = edgeAngle; // Angle from X-axis (0°)
+    } else {
+        angleFromAxis = edgeAngle - 90; // Angle from Z-axis (90°)
     }
     
-    // Visualize the detected edge with a red line AFTER final adjustment
-    if (finalSamples.length > 0) {
-        // Recalculate samples after correction
-        const correctedSamples = [];
+    // Apply the final correction to achieve perfect alignment!
+    console.log('Edge angle:', edgeAngle, 'degrees from horizontal');
+    console.log('Angle from target axis:', angleFromAxis, 'degrees');
+    
+    if (Math.abs(angleFromAxis) > 0.1) { // If more than 0.1 degrees off
+        // Flipping the sign - if it was going the wrong way, this should fix it
+        const correctionDegrees = angleFromAxis; // POSITIVE angleFromAxis
+        const correctionRadians = correctionDegrees * Math.PI / 180;
+        console.log('Applying rotation correction:', correctionDegrees, 'degrees');
+        obj.rotation.y += correctionRadians; // Apply the correction
+        obj.updateMatrixWorld(true);
+        
+        // Recalculate the bounding box and update the red line
         const correctedBox = new THREE.Box3().setFromObject(obj);
+        const newBoxMin = correctedBox.min;
+        const newBoxMax = correctedBox.max;
         
-        obj.traverse((child) => {
-            if (child.isMesh && child.geometry) {
-                const positions = child.geometry.attributes.position;
-                if (positions) {
-                    for (let i = 0; i < positions.count && correctedSamples.length < 50; i++) {
-                        const vertex = new THREE.Vector3();
-                        vertex.fromBufferAttribute(positions, i);
-                        vertex.applyMatrix4(child.matrixWorld);
-                        
-                        if (Math.abs(vertex.y - correctedBox.min.y) < 0.5) {
-                            correctedSamples.push({ x: vertex.x, z: vertex.z, y: vertex.y });
-                        }
-                    }
-                }
-            }
-        });
-        
-        // Find the extreme points along the aligned axis
-        let minPoint, maxPoint;
-        
+        let newPoints;
         if (bestAlignedAxis === 'X') {
-            // Edge is aligned with X axis, find min and max X points
-            correctedSamples.sort((a, b) => a.x - b.x);
-            minPoint = correctedSamples[0];
-            maxPoint = correctedSamples[correctedSamples.length - 1];
+            newPoints = [
+                new THREE.Vector3(newBoxMin.x, newBoxMin.y, newBoxMin.z),
+                new THREE.Vector3(newBoxMax.x, newBoxMin.y, newBoxMin.z)
+            ];
         } else {
-            // Edge is aligned with Z axis, find min and max Z points
-            correctedSamples.sort((a, b) => a.z - b.z);
-            minPoint = correctedSamples[0];
-            maxPoint = correctedSamples[correctedSamples.length - 1];
+            newPoints = [
+                new THREE.Vector3(newBoxMin.x, newBoxMin.y, newBoxMin.z),
+                new THREE.Vector3(newBoxMin.x, newBoxMin.y, newBoxMax.z)
+            ];
         }
         
-        // Create a red line to show the detected edge
-        const points = [
-            new THREE.Vector3(minPoint.x, minPoint.y, minPoint.z),
-            new THREE.Vector3(maxPoint.x, maxPoint.y, maxPoint.z)
-        ];
+        // Update the red line geometry
+        line.geometry.setFromPoints(newPoints);
+        sphere1.position.copy(newPoints[0]);
+        sphere2.position.copy(newPoints[1]);
         
-        const geometry = new THREE.BufferGeometry().setFromPoints(points);
-        const material = new THREE.LineBasicMaterial({ 
-            color: 0xff0000, 
-            linewidth: 3,
-            depthTest: false,
-            depthWrite: false
-        });
-        const line = new THREE.Line(geometry, material);
-        line.name = 'alignmentDebugLine';
-        scene.add(line);
-        
-        // Also add spheres at the endpoints for clarity
-        const sphereGeometry = new THREE.SphereGeometry(0.2, 16, 16);
-        const sphereMaterial = new THREE.MeshBasicMaterial({ 
-            color: 0xff0000,
-            depthTest: false,
-            depthWrite: false
-        });
-        
-        const sphere1 = new THREE.Mesh(sphereGeometry, sphereMaterial);
-        sphere1.position.copy(points[0]);
-        line.add(sphere1);
-        
-        const sphere2 = new THREE.Mesh(sphereGeometry, sphereMaterial);
-        sphere2.position.copy(points[1]);
-        line.add(sphere2);
-        
-        // Add reference axis lines to show what we're aligning to
-        const axisGroup = new THREE.Group();
-        axisGroup.name = 'axisDebugLines';
-        
-        // Get bounds for axis lines
-        const xMin = Math.min(...correctedSamples.map(p => p.x));
-        const xMax = Math.max(...correctedSamples.map(p => p.x));
-        const zMin = Math.min(...correctedSamples.map(p => p.z));
-        const zMax = Math.max(...correctedSamples.map(p => p.z));
-        
-        // X-axis line (green)
-        const xAxisGeometry = new THREE.BufferGeometry().setFromPoints([
-            new THREE.Vector3(xMin - 2, minPoint.y, minPoint.z),
-            new THREE.Vector3(xMax + 2, minPoint.y, minPoint.z)
-        ]);
-        const xAxisMaterial = new THREE.LineBasicMaterial({ 
-            color: 0x00ff00, 
-            linewidth: 2,
-            depthTest: false,
-            depthWrite: false
-        });
-        const xAxisLine = new THREE.Line(xAxisGeometry, xAxisMaterial);
-        axisGroup.add(xAxisLine);
-        
-        // Z-axis line (blue)
-        const zAxisGeometry = new THREE.BufferGeometry().setFromPoints([
-            new THREE.Vector3(minPoint.x, minPoint.y, zMin - 2),
-            new THREE.Vector3(minPoint.x, minPoint.y, zMax + 2)
-        ]);
-        const zAxisMaterial = new THREE.LineBasicMaterial({ 
-            color: 0x0000ff, 
-            linewidth: 2,
-            depthTest: false,
-            depthWrite: false
-        });
-        const zAxisLine = new THREE.Line(zAxisGeometry, zAxisMaterial);
-        axisGroup.add(zAxisLine);
-        
-        scene.add(axisGroup);
-        
-        // Calculate angle between red line and axis
-        const edgeDx = maxPoint.x - minPoint.x;
-        const edgeDz = maxPoint.z - minPoint.z;
-        const edgeAngle = Math.atan2(edgeDz, edgeDx) * 180 / Math.PI;
-        
-        let angleFromAxis;
-        if (bestAlignedAxis === 'X') {
-            angleFromAxis = edgeAngle; // Angle from X-axis (0°)
-        } else {
-            angleFromAxis = edgeAngle - 90; // Angle from Z-axis (90°)
-        }
-        
-        // Apply the final correction to achieve perfect alignment!
-        console.log('Edge angle:', edgeAngle, 'degrees from horizontal');
-        console.log('Angle from target axis:', angleFromAxis, 'degrees');
-        
-        if (Math.abs(angleFromAxis) > 0.1) { // If more than 0.1 degrees off
-            // Flipping the sign - if it was going the wrong way, this should fix it
-            const correctionDegrees = angleFromAxis; // POSITIVE angleFromAxis
-            const correctionRadians = correctionDegrees * Math.PI / 180;
-            console.log('Applying rotation correction:', correctionDegrees, 'degrees');
-            obj.rotation.y += correctionRadians; // Apply the correction
-            obj.updateMatrixWorld(true);
-            
-            // Recalculate the red line position after correction
-            const finalCorrectedSamples = [];
-            const finalCorrectedBox = new THREE.Box3().setFromObject(obj);
-            
-            obj.traverse((child) => {
-                if (child.isMesh && child.geometry) {
-                    const positions = child.geometry.attributes.position;
-                    if (positions) {
-                        for (let i = 0; i < positions.count && finalCorrectedSamples.length < 50; i++) {
-                            const vertex = new THREE.Vector3();
-                            vertex.fromBufferAttribute(positions, i);
-                            vertex.applyMatrix4(child.matrixWorld);
-                            
-                            if (Math.abs(vertex.y - finalCorrectedBox.min.y) < 0.5) {
-                                finalCorrectedSamples.push({ x: vertex.x, z: vertex.z, y: vertex.y });
-                            }
-                        }
-                    }
-                }
-            });
-            
-            // Update the red line to show the corrected position
-            if (finalCorrectedSamples.length > 0) {
-                let newMinPoint, newMaxPoint;
-                
-                if (bestAlignedAxis === 'X') {
-                    finalCorrectedSamples.sort((a, b) => a.x - b.x);
-                    newMinPoint = finalCorrectedSamples[0];
-                    newMaxPoint = finalCorrectedSamples[finalCorrectedSamples.length - 1];
-                } else {
-                    finalCorrectedSamples.sort((a, b) => a.z - b.z);
-                    newMinPoint = finalCorrectedSamples[0];
-                    newMaxPoint = finalCorrectedSamples[finalCorrectedSamples.length - 1];
-                }
-                
-                // Update the red line geometry
-                const newPoints = [
-                    new THREE.Vector3(newMinPoint.x, newMinPoint.y, newMinPoint.z),
-                    new THREE.Vector3(newMaxPoint.x, newMaxPoint.y, newMaxPoint.z)
-                ];
-                
-                line.geometry.setFromPoints(newPoints);
-                sphere1.position.copy(newPoints[0]);
-                sphere2.position.copy(newPoints[1]);
-            }
-            
-            angleFromAxis = 0; // Should now be perfectly aligned
-        }
-        
-        // Add text to show which axis
-        console.log(`Red line shows edge aligned to ${bestAlignedAxis} axis`);
-        console.log('Final rotation:', obj.rotation.y * 180 / Math.PI, 'degrees');
-        console.log('Edge angle from axis after correction:', angleFromAxis, 'degrees');
-        showToast(`Edge perfectly aligned to ${bestAlignedAxis} axis!`, 'success');
-        
-        // Remove the debug visualization after 5 seconds
-        setTimeout(() => {
-            const debugLine = scene.getObjectByName('alignmentDebugLine');
-            if (debugLine) scene.remove(debugLine);
-            const axisLines = scene.getObjectByName('axisDebugLines');
-            if (axisLines) scene.remove(axisLines);
-        }, 5000);
+        angleFromAxis = 0; // Should now be perfectly aligned
     }
+    
+    // Add text to show which axis
+    console.log(`Red line shows edge aligned to ${bestAlignedAxis} axis`);
+    console.log('Final rotation:', obj.rotation.y * 180 / Math.PI, 'degrees');
+    console.log('Edge angle from axis after correction:', angleFromAxis, 'degrees');
+    showToast(`Edge perfectly aligned to ${bestAlignedAxis} axis!`, 'success');
+    
+    // Remove the debug visualization after 5 seconds
+    setTimeout(() => {
+        const debugLine = scene.getObjectByName('alignmentDebugLine');
+        if (debugLine) scene.remove(debugLine);
+        const axisLines = scene.getObjectByName('axisDebugLines');
+        if (axisLines) scene.remove(axisLines);
+    }, 5000);
     
     // Now scale the model to match structure footprint
     // Compute structure dimensions (in voxel units)
