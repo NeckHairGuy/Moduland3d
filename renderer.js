@@ -95,6 +95,16 @@ function showTransformPanel(object) {
             <div class="field">Scale Y <input type="number" step="0.01" id="sy" style="width:60px"></div>
             <div class="field">Scale Z <input type="number" step="0.01" id="sz" style="width:60px"></div>
             <button id="fitBtn" style="margin-top:8px;padding:4px 8px;">Fit to Structure</button>
+            <div style="margin-top:10px;text-align:center;">
+                <button id="rotCCW" style="padding:4px 8px;margin:0 5px;">↺ 90°</button>
+                <button id="rotCW" style="padding:4px 8px;margin:0 5px;">↻ 90°</button>
+            </div>
+            <div id="cornerScores" style="margin-top:10px;font-size:11px;background:#333;color:#fff;padding:5px;border-radius:3px;">
+                <div><span style="background:#ffff00;color:#000;padding:0 3px;">SW</span>: <span id="swScore">-</span> (target: empty)</div>
+                <div>SE: <span id="seScore">-</span></div>
+                <div>NW: <span id="nwScore">-</span></div>
+                <div>NE: <span id="neScore">-</span></div>
+            </div>
         `;
         document.body.appendChild(transformPanel);
 
@@ -124,6 +134,7 @@ function showTransformPanel(object) {
                 o.scale.set(realScaleX, realScaleY, realScaleZ);
                 o.updateMatrixWorld();
                 isUpdatingFromPanel = false;
+                updateCornerScores();
             });
         });
         // Attach Fit button listener once
@@ -143,8 +154,197 @@ function showTransformPanel(object) {
             autoAlignModelToStructureFoundation(obj, sid);
             updateTransformPanel();
         });
+        
+        // Attach rotation button listeners
+        const rotCCW = transformPanel.querySelector('#rotCCW');
+        const rotCW = transformPanel.querySelector('#rotCW');
+        
+        rotCCW.addEventListener('click', () => {
+            if (!transformPanelObject) return;
+            transformPanelObject.rotation.y -= Math.PI / 2;
+            transformPanelObject.updateMatrixWorld(true);
+            updateTransformPanel();
+            updateCornerScores();
+        });
+        
+        rotCW.addEventListener('click', () => {
+            if (!transformPanelObject) return;
+            transformPanelObject.rotation.y += Math.PI / 2;
+            transformPanelObject.updateMatrixWorld(true);
+            updateTransformPanel();
+            updateCornerScores();
+        });
     }
     updateTransformPanel();
+    
+    // Add SW corner highlight
+    showSWCornerHighlight();
+    
+    // Update corner scores
+    updateCornerScores();
+}
+
+function showSWCornerHighlight() {
+    // Remove any existing highlights
+    ['swCornerHighlight', 'cornerTestRegions'].forEach(name => {
+        const old = scene.getObjectByName(name);
+        if (old) scene.remove(old);
+    });
+    
+    // Determine which structure to check against
+    const sid = transformPanelObject?.userData?.structureId ?? (focusedStructure && focusedStructure.id);
+    if (!sid) return;
+    
+    const sInfo = computeStructureFoundationInfo(sid);
+    if (!sInfo || !transformPanelObject) return;
+    
+    // Create group for all corner highlights
+    const cornerGroup = new THREE.Group();
+    cornerGroup.name = 'cornerTestRegions';
+    
+    // Define 1x1 corner regions one voxel outside the structure diagonally
+    const voxelSize = 1.0;
+    
+    // Each corner is positioned just outside the structure bounds
+    const cornerDefs = [
+        { name: 'SW', color: 0xffff00, opacity: 0.5, 
+          minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize, 
+          minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
+        { name: 'SE', color: 0xff0000, opacity: 0.2,
+          minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX, 
+          minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
+        { name: 'NW', color: 0x00ff00, opacity: 0.2,
+          minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize, 
+          minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ },
+        { name: 'NE', color: 0x0000ff, opacity: 0.2,
+          minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX, 
+          minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ }
+    ];
+    
+    // Create visual boxes for each corner region
+    cornerDefs.forEach(corner => {
+        const width = corner.maxX - corner.minX;
+        const depth = corner.maxZ - corner.minZ;
+        const height = 0.2;
+        
+        const box = new THREE.Mesh(
+            new THREE.BoxGeometry(width, height, depth),
+            new THREE.MeshBasicMaterial({ 
+                color: corner.color, 
+                transparent: true, 
+                opacity: corner.opacity,
+                depthTest: false 
+            })
+        );
+        
+        box.position.set(
+            (corner.minX + corner.maxX) / 2,
+            sInfo.baseY,
+            (corner.minZ + corner.maxZ) / 2
+        );
+        
+        cornerGroup.add(box);
+    });
+    
+    scene.add(cornerGroup);
+    
+    // Also add the original SW corner highlight at structure position
+    const highlight = new THREE.Mesh(
+        new THREE.BoxGeometry(1, 1, 1),
+        new THREE.MeshBasicMaterial({ 
+            color: 0xffff00, 
+            transparent: true, 
+            opacity: 0.3,
+            depthTest: false 
+        })
+    );
+    
+    // Position at SW corner (max X, max Z) - where missing voxel would be
+    highlight.position.set(
+        sInfo.rMaxX + 0.5,  // Beyond the max boundary
+        sInfo.baseY,
+        sInfo.rMaxZ + 0.5   // Beyond the max boundary
+    );
+    highlight.name = 'swCornerHighlight';
+    scene.add(highlight);
+}
+
+function updateCornerScores() {
+    if (!transformPanel || !transformPanelObject) return;
+    
+    const sid = transformPanelObject.userData?.structureId ?? (focusedStructure && focusedStructure.id);
+    if (!sid) return;
+    
+    const sInfo = computeStructureFoundationInfo(sid);
+    if (!sInfo) return;
+    
+    // Update visual highlights to show current position
+    showSWCornerHighlight();
+    
+    // Get current model bounding box
+    const testBox = new THREE.Box3().setFromObject(transformPanelObject);
+    
+    // Define 1x1 corner regions one voxel outside the structure diagonally (same as visual highlights)
+    const voxelSize = 1.0;
+    const corners = {
+        SW: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize, 
+              minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
+        SE: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX, 
+              minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
+        NW: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize, 
+              minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ },
+        NE: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX, 
+              minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ }
+    };
+    
+    // Check if each corner region contains model geometry (filled vs empty)
+    let cornerStatus = { SW: false, SE: false, NW: false, NE: false };
+    const yTolerance = 0.5;
+    
+    // Use raycasting to detect if there's geometry in each corner
+    const raycaster = new THREE.Raycaster();
+    
+    Object.keys(corners).forEach(cornerName => {
+        const corner = corners[cornerName];
+        
+        // Test multiple points within the corner region
+        const testPoints = [
+            { x: corner.minX + 0.1, z: corner.minZ + 0.1 },
+            { x: corner.maxX - 0.1, z: corner.minZ + 0.1 },
+            { x: corner.minX + 0.1, z: corner.maxZ - 0.1 },
+            { x: corner.maxX - 0.1, z: corner.maxZ - 0.1 },
+            { x: (corner.minX + corner.maxX) / 2, z: (corner.minZ + corner.maxZ) / 2 }
+        ];
+        
+        // Cast rays downward from above to check for geometry
+        for (const point of testPoints) {
+            raycaster.set(
+                new THREE.Vector3(point.x, sInfo.baseY + 2, point.z),
+                new THREE.Vector3(0, -1, 0)
+            );
+            
+            const intersects = raycaster.intersectObject(transformPanelObject, true);
+            
+            // Check if any intersection is near the base level
+            for (const hit of intersects) {
+                if (Math.abs(hit.point.y - sInfo.baseY) < yTolerance) {
+                    cornerStatus[cornerName] = true;
+                    break;
+                }
+            }
+            
+            if (cornerStatus[cornerName]) break;
+        }
+    });
+    
+    // Update the display with filled (■) or empty (□) indicators
+    const getIcon = (filled) => filled ? '■' : '□';
+    const getStyle = (filled) => filled ? 'color:#0a0' : 'color:#d00';
+    
+    document.getElementById('swScore').innerHTML = `<span style="${getStyle(cornerStatus.SW)}">${getIcon(cornerStatus.SW)}</span>`;
+    document.getElementById('seScore').innerHTML = `<span style="${getStyle(cornerStatus.SE)}">${getIcon(cornerStatus.SE)}</span>`;
+    document.getElementById('nwScore').innerHTML = `<span style="${getStyle(cornerStatus.NW)}">${getIcon(cornerStatus.NW)}</span>`;
+    document.getElementById('neScore').innerHTML = `<span style="${getStyle(cornerStatus.NE)}">${getIcon(cornerStatus.NE)}</span>`;
 }
 
 function updateTransformPanel() {
@@ -3594,6 +3794,7 @@ async function attachTripoTransformControls(target) {
     tripoTransformControls.addEventListener('dragging-changed', (e) => {
         isDraggingGizmo = e.value;
         const mode = typeof tripoTransformControls.getMode === 'function' ? tripoTransformControls.getMode() : tripoTransformControls.mode;
+        updateCornerScores();
         
         if (mode === 'scale') {
             if (e.value) {
@@ -3656,6 +3857,8 @@ async function attachTripoTransformControls(target) {
             
             target.scale.setScalar(factor);
         }
+        updateCornerScores();
+        updateTransformPanel();
     });
     tripoTransformControls.attach(target);
     scene.add(tripoTransformControls);
@@ -3696,6 +3899,14 @@ function detachTripoTransformControls() {
         transformPanel = null;
         transformPanelObject = null;
     }
+    
+    // Remove corner highlights
+    ['swCornerHighlight', 'cornerTestRegions'].forEach(name => {
+        const highlight = scene.getObjectByName(name);
+        if (highlight) {
+            scene.remove(highlight);
+        }
+    });
 }
 
 
@@ -5526,6 +5737,10 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
     // Remove any previous debug visualization
     const oldDebug = scene.getObjectByName('alignmentDebugLine');
     if (oldDebug) scene.remove(oldDebug);
+    const oldSWIndicator = scene.getObjectByName('swCornerIndicator');
+    if (oldSWIndicator) scene.remove(oldSWIndicator);
+    const oldAxisLines = scene.getObjectByName('axisDebugLines');
+    if (oldAxisLines) scene.remove(oldAxisLines);
 
     // Find the rotation that best aligns the model's BOUNDING BOX edges with X/Z axes
     let bestRotation = 0;
@@ -5766,6 +5981,117 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
     
     // Keep the original position (centered on structure)
     obj.position.copy(originalPosition);
+    
+    // Now test 4 cardinal rotations to find which one leaves SW corner most exposed
+    obj.updateMatrixWorld(true);
+    const baseRotation = obj.rotation.y;
+    let bestOrientation = 0;
+    let minSWCoverage = Infinity;
+    let bestScore = -Infinity;
+    
+    console.log('Testing orientations for missing corner placement...');
+    
+    for (let i = 0; i < 4; i++) {
+        const testRotation = baseRotation + (i * Math.PI / 2);
+        obj.rotation.y = testRotation;
+        obj.updateMatrixWorld(true);
+        
+        // Get model bounding box for this rotation
+        const testBox = new THREE.Box3().setFromObject(obj);
+        
+        // Define corner regions (using structure bounds as reference)
+        const cornerSize = 1.5; // Size of corner region to check
+        const corners = {
+            SW: { minX: sInfo.rMinX, maxX: sInfo.rMinX + cornerSize, minZ: sInfo.rMinZ, maxZ: sInfo.rMinZ + cornerSize },
+            SE: { minX: sInfo.rMaxX - cornerSize, maxX: sInfo.rMaxX, minZ: sInfo.rMinZ, maxZ: sInfo.rMinZ + cornerSize },
+            NW: { minX: sInfo.rMinX, maxX: sInfo.rMinX + cornerSize, minZ: sInfo.rMaxZ - cornerSize, maxZ: sInfo.rMaxZ },
+            NE: { minX: sInfo.rMaxX - cornerSize, maxX: sInfo.rMaxX, minZ: sInfo.rMaxZ - cornerSize, maxZ: sInfo.rMaxZ }
+        };
+        
+        // Count vertices in ALL corner regions
+        let cornerCounts = { SW: 0, SE: 0, NW: 0, NE: 0 };
+        const yTolerance = 0.5; // Only check near the base
+        const maxSamples = 1000; // Limit sampling for performance
+        let sampleCount = 0;
+        
+        obj.traverse((child) => {
+            if (child.isMesh && child.geometry) {
+                const positions = child.geometry.attributes.position;
+                if (positions) {
+                    // Sample vertices evenly (skip some if there are too many)
+                    const step = Math.max(1, Math.floor(positions.count / maxSamples));
+                    
+                    for (let j = 0; j < positions.count && sampleCount < maxSamples; j += step) {
+                        const vertex = new THREE.Vector3();
+                        vertex.fromBufferAttribute(positions, j);
+                        vertex.applyMatrix4(child.matrixWorld);
+                        sampleCount++;
+                        
+                        // Check if vertex is near base level
+                        if (Math.abs(vertex.y - testBox.min.y) < yTolerance) {
+                            // Check each corner
+                            if (vertex.x >= corners.SW.minX && vertex.x <= corners.SW.maxX &&
+                                vertex.z >= corners.SW.minZ && vertex.z <= corners.SW.maxZ) {
+                                cornerCounts.SW++;
+                            }
+                            if (vertex.x >= corners.SE.minX && vertex.x <= corners.SE.maxX &&
+                                vertex.z >= corners.SE.minZ && vertex.z <= corners.SE.maxZ) {
+                                cornerCounts.SE++;
+                            }
+                            if (vertex.x >= corners.NW.minX && vertex.x <= corners.NW.maxX &&
+                                vertex.z >= corners.NW.minZ && vertex.z <= corners.NW.maxZ) {
+                                cornerCounts.NW++;
+                            }
+                            if (vertex.x >= corners.NE.minX && vertex.x <= corners.NE.maxX &&
+                                vertex.z >= corners.NE.minZ && vertex.z <= corners.NE.maxZ) {
+                                cornerCounts.NE++;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        
+        // Calculate score: maximize coverage in other corners, minimize in SW
+        // Higher score is better
+        const otherCornersTotal = cornerCounts.SE + cornerCounts.NW + cornerCounts.NE;
+        const score = otherCornersTotal - (cornerCounts.SW * 3); // Heavily penalize SW coverage
+        
+        console.log(`Rotation ${i * 90}°: SW=${cornerCounts.SW}, SE=${cornerCounts.SE}, NW=${cornerCounts.NW}, NE=${cornerCounts.NE}, Score=${score}`);
+        
+        if (cornerCounts.SW < minSWCoverage || 
+            (cornerCounts.SW === minSWCoverage && score > bestScore)) {
+            minSWCoverage = cornerCounts.SW;
+            bestOrientation = i;
+            bestScore = score;
+        }
+    }
+    
+    // Apply the best orientation
+    const finalRotation = baseRotation + (bestOrientation * Math.PI / 2);
+    obj.rotation.y = finalRotation;
+    obj.updateMatrixWorld(true);
+    
+    console.log(`Selected orientation: ${bestOrientation * 90}° rotation (SW coverage: ${minSWCoverage}, best score: ${bestScore})`);
+    
+    // Add a temporary visual indicator for the SW corner
+    const swIndicator = new THREE.Mesh(
+        new THREE.BoxGeometry(0.3, 0.3, 0.3),
+        new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.7 })
+    );
+    swIndicator.position.set(
+        sInfo.rMinX + 0.5,
+        sInfo.baseY,
+        sInfo.rMinZ + 0.5
+    );
+    swIndicator.name = 'swCornerIndicator';
+    scene.add(swIndicator);
+    
+    // Remove the SW indicator after 5 seconds
+    setTimeout(() => {
+        const indicator = scene.getObjectByName('swCornerIndicator');
+        if (indicator) scene.remove(indicator);
+    }, 5000);
     
     // Adjust Y position to rest on structure base
     obj.updateMatrixWorld(true);
