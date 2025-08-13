@@ -51,12 +51,6 @@ let structureIdToSkinUrls = new Map(); // id -> array of skin image URLs
 let activeSkinIndex = new Map(); // id -> current index
 let structureGalleries = new Map(); // id -> array of gallery items HTML
 let latestCapturedImageUrl = null; // Store the latest captured image for Send to Flux
-let skinOverlayMesh = null; // current skin overlay mesh in scene
-let skinEls = new Map(); // id -> wrapper div element
-let skinAdjustActive = false;
-let adjustingStructureId = null;
-let skinStates = new Map(); // id -> {x,y,scale}
-let lastPointer = null;
 let lastFalSeed = null;
 // Persistence
 const PERSIST_KEY = 'moduland_persist_state_v2';
@@ -1633,15 +1627,6 @@ function reattachGalleryEventListeners() {
             });
         }
         
-        // Re-attach stick skin button listeners
-        const stickSkinBtn = item.querySelector('.stick-skin');
-        if (stickSkinBtn && itemSrc) {
-            stickSkinBtn.addEventListener('click', async () => {
-                showToast('Preparing skin…', 'info');
-                await addSkinToFocusedStructure(itemSrc);
-            });
-        }
-        
         // If this is a TRIPO item, ensure viewer initialized and buttons wired
         if (itemType === 'tripo') {
             const viewer = item.querySelector('.tripo-viewer');
@@ -1692,13 +1677,9 @@ function appendGalleryImage(label, dataUrl, structureId) {
             <button class="download-btn" data-filename="${filename}">Download</button>
         </div>
         <img class="capture-img" src="${dataUrl}" alt="${label}">
-        <button class="capture-img-action stick-skin">Stick to structure</button>
     `;
     const btn = item.querySelector('.download-btn');
     btn.addEventListener('click', () => downloadDataURL(dataUrl, filename));
-    item.querySelector('.stick-skin').addEventListener('click', async () => {
-        await addSkinToFocusedStructure(dataUrl);
-    });
     gallery.appendChild(item);
 }
 
@@ -2672,11 +2653,6 @@ function updateStructuresMenu() {
                     <button class="structure-delete" title="Delete" style="font-size:12px; padding:2px 6px;">🗑</button>
                 </div>
             </div>
-            <div class="skin-controls">
-                <button class="skin-btn skin-left">◀</button>
-                <button class="skin-btn skin-adjust">🎯</button>
-                <button class="skin-btn skin-right">▶</button>
-            </div>
         `;
         item.addEventListener('click', () => loadStructure(structure));
         
@@ -2687,15 +2663,6 @@ function updateStructuresMenu() {
             toggleStructureVisibility(structure.id, visBtn);
         });
         
-        // Skin buttons
-        const left = item.querySelector('.skin-left');
-        const right = item.querySelector('.skin-right');
-        const adjust = item.querySelector('.skin-adjust');
-        left.addEventListener('click', (e) => { e.stopPropagation(); cycleSkin(structure.id, -1); persistStateIfEnabled(); });
-        right.addEventListener('click', (e) => { e.stopPropagation(); cycleSkin(structure.id, +1); persistStateIfEnabled(); });
-        adjust.addEventListener('click', (e) => {
-            e.stopPropagation(); toggleSkinAdjust(structure.id, adjust);
-        });
         const delBtn = item.querySelector('.structure-delete');
         delBtn.addEventListener('click', (e) => { e.stopPropagation(); deleteStructureById(structure.id); });
         list.appendChild(item);
@@ -2786,7 +2753,6 @@ function loadStructure(structure) {
         createGizmos();
     }
     // When loading a structure, apply its active skin if any
-    applyActiveSkinForFocusedStructure();
     
     // If we're in focus mode, transition to the new structure's focus mode
     if (focusMode) {
@@ -2806,14 +2772,11 @@ function onWindowResize() {
     camera.updateProjectionMatrix();
     
     renderer.setSize(container.clientWidth, container.clientHeight);
-    updateScreenOverlayTransform();
 }
 
 function animate() {
     requestAnimationFrame(animate);
     renderer.render(scene, camera);
-    updateScreenOverlayVisibility();
-    updateScreenOverlayTransform();
 
     // Update axis indicator orientation
     if (axisCamera && axisRenderer) {
@@ -3121,7 +3084,7 @@ function attachFalResult(imageUrl, sourceStructureId = null) {
         <img class="capture-img" src="${imageUrl}" alt="FLUX Depth Result">
         <div class="capture-actions">
             <button class="send-tripo-btn">SEND TO TRIPO</button>
-            <button class="capture-img-action stick-skin">Stick to structure</button>
+            ${lastFalSeed ? `<button class="copy-seed-btn" data-seed="${lastFalSeed}">Copy Seed</button>` : ''}
         </div>
     `;
     item.querySelector('.download-btn').addEventListener('click', async () => {
@@ -3143,11 +3106,17 @@ function attachFalResult(imageUrl, sourceStructureId = null) {
             sendBtn.disabled = false;
         }
     });
-    // Stick to structure (as skin)
-    item.querySelector('.stick-skin').addEventListener('click', async () => {
-        showToast('Preparing skin…', 'info');
-        await addSkinToFocusedStructure(imageUrl);
-    });
+    // Copy seed button
+    const copySeedBtn = item.querySelector('.copy-seed-btn');
+    if (copySeedBtn && lastFalSeed) {
+        copySeedBtn.addEventListener('click', () => {
+            navigator.clipboard.writeText(String(lastFalSeed)).then(() => {
+                showToast(`Seed ${lastFalSeed} copied!`, 'success');
+            }).catch(() => {
+                showToast('Failed to copy seed', 'error');
+            });
+        });
+    }
     // Add to the correct structure's gallery
     if (structureId != null) {
         // If this is the currently focused structure, add to visible gallery and save state
@@ -3949,70 +3918,6 @@ function setGroundElevation(raised) {
     if (originMarker) originMarker.position.y = y;
 }
 
-async function addSkinToFocusedStructure(imageUrl) {
-    if (!focusedStructure) {
-        showToast('Load a saved structure first', 'error');
-        debugLog('skin:error:no-structure');
-        return;
-    }
-    debugLog('skin:start', { imageUrl: imageUrl.slice(0, 64) });
-    const publicUrl = imageUrl.startsWith('data:') ? (await uploadViaFalClient(imageUrl)) || imageUrl : imageUrl;
-    if (publicUrl === imageUrl && imageUrl.startsWith('data:')) {
-        showToast('Could not upload image for background removal', 'error');
-        debugLog('skin:upload:miss');
-    } else {
-        debugLog('skin:upload:ok', { publicUrl: publicUrl.slice(0, 64) });
-    }
-    const processedUrl = await removeBackground(publicUrl) || publicUrl;
-    debugLog('skin:bg-removed', { processedUrl: processedUrl.slice(0, 64), usedRMBG: processedUrl !== publicUrl });
-    // Save to structure
-    const id = focusedStructure.id;
-    if (!structureIdToSkinUrls.has(id)) structureIdToSkinUrls.set(id, []);
-    const arr = structureIdToSkinUrls.get(id);
-    arr.push(processedUrl);
-    activeSkinIndex.set(id, arr.length - 1);
-    applyActiveSkinForFocusedStructure();
-    updateStructuresMenu();
-    showToast('Skin applied', 'success');
-}
-
-function applyActiveSkinForFocusedStructure() {
-    if (!focusedStructure) return;
-    const id = focusedStructure.id;
-    const arr = structureIdToSkinUrls.get(id) || [];
-    const idx = activeSkinIndex.get(id) ?? -1; // -1 means none
-    if (idx < 0) {
-        clearSkinOverlay();
-        debugLog('skin:apply:none');
-        return;
-    }
-    const url = arr[idx];
-    if (!url) { clearSkinOverlay(); return; }
-    addScreenSpaceSkin(url);
-}
-
-function clearSkinOverlay() {
-    const layer = document.getElementById('skinOverlayLayer');
-    if (!layer) return;
-    layer.innerHTML = '';
-    skinEls.forEach(el => el.remove());
-    skinEls.clear();
-    skinStates.clear();
-}
-
-function cycleSkin(structureId, dir) {
-    const arr = structureIdToSkinUrls.get(structureId) || [];
-    const options = arr.length + 1; // include 'none' at ordinal 0
-    if (options <= 1) { clearSkinOverlay(); activeSkinIndex.set(structureId, -1); return; }
-    const current = activeSkinIndex.get(structureId) ?? -1; // -1 -> none
-    let ordinal = current + 1; // map -1..n-1 to 0..n
-    ordinal = (ordinal + dir + options) % options;
-    const nextIndex = ordinal - 1; // back to -1..n-1
-    activeSkinIndex.set(structureId, nextIndex);
-    if (focusedStructure && focusedStructure.id === structureId) {
-        applyActiveSkinForFocusedStructure();
-    }
-}
 
 function computeBoundsForResetCamera() {
     if (focusMode && focusedStructureVoxels.size > 0) {
@@ -4056,76 +3961,6 @@ async function removeBackground(imageUrl) {
     }
 }
 
-function addScreenSpaceSkin(imageUrl) {
-    const layer = document.getElementById('skinOverlayLayer');
-    if (!layer) { debugLog('skin:layer:missing'); return; }
-    // Wrapper allows visible adjust frame and simpler transforms
-    const wrap = document.createElement('div');
-    wrap.style.position = 'absolute';
-    wrap.style.pointerEvents = 'none';
-    wrap.style.boxSizing = 'border-box';
-    wrap.style.border = skinAdjustActive ? '1px dashed #00e5ff' : 'none';
-    const img = document.createElement('img');
-    img.src = imageUrl;
-    img.onload = () => debugLog('skin:image:onload', { naturalWidth: img.naturalWidth, naturalHeight: img.naturalHeight });
-    img.onerror = (e) => debugLog('skin:image:onerror');
-    img.style.width = '100%';
-    img.style.height = '100%';
-    const rect = computeFocusedStructureScreenRect();
-    if (rect) {
-        wrap.style.left = `${rect.x}px`;
-        wrap.style.top = `${rect.y}px`;
-        wrap.style.width = `${rect.w}px`;
-        wrap.style.height = `${rect.h}px`;
-        wrap.style.transform = `translate(0,0) scale(${skinAdjustState.scale}) translate(${skinAdjustState.x}px, ${skinAdjustState.y}px)`;
-    } else {
-        wrap.style.left = '50%';
-        wrap.style.top = '50%';
-        wrap.style.transform = `translate(-50%, -50%) scale(${skinAdjustState.scale}) translate(${skinAdjustState.x}px, ${skinAdjustState.y}px)`;
-        debugLog('skin:rect:missing');
-    }
-    wrap.style.filter = 'drop-shadow(0 2px 6px rgba(0,0,0,0.25))';
-    wrap.appendChild(img);
-    layer.appendChild(wrap);
-    // Store; caller will update position via updateScreenOverlayTransform
-    if (focusedStructure) {
-        skinEls.set(focusedStructure.id, wrap);
-        if (!skinStates.has(focusedStructure.id)) skinStates.set(focusedStructure.id, { x: 0, y: 0, scale: 1 });
-    }
-    updateScreenOverlayVisibility();
-    updateScreenOverlayTransform();
-    updateSkinDebug();
-}
-
-function updateScreenOverlayVisibility() {
-    const layer = document.getElementById('skinOverlayLayer');
-    if (!layer) return;
-    const elev = THREE.MathUtils.degToRad(DEFAULT_ISO_ELEVATION_DEG);
-    const az = THREE.MathUtils.degToRad(DEFAULT_ISO_AZIMUTH_DEG);
-    // THREE cameras look down -Z; getWorldDirection returns forward (-Z in world). Our analytic dir must match that forward.
-    const defaultDir = new THREE.Vector3(Math.cos(elev) * Math.cos(az), Math.sin(elev), Math.cos(elev) * Math.sin(az)).normalize().negate();
-    const curDir = new THREE.Vector3();
-    camera.getWorldDirection(curDir);
-    const dot = curDir.normalize().dot(defaultDir);
-    layer.style.display = (dot > 0.995) ? 'block' : 'none';
-    // Removed skin visibility debug logging
-}
-
-function updateScreenOverlayTransform() {
-    if (skinEls.size === 0) return;
-    skinEls.forEach((el, structureId) => {
-        const rect = computeStructureScreenRect(structureId);
-        const state = skinStates.get(structureId) || { x: 0, y: 0, scale: 1 };
-        if (rect) {
-            el.style.left = `${rect.x}px`;
-            el.style.top = `${rect.y}px`;
-            el.style.width = `${rect.w}px`;
-            el.style.height = `${rect.h}px`;
-            el.style.transform = `translate(0,0) scale(${state.scale}) translate(${state.x}px, ${state.y}px)`;
-        }
-    });
-    updateSkinDebug();
-}
 
 function computeFocusedStructureScreenRect() {
     if (!focusedStructure) return null;
@@ -4178,93 +4013,8 @@ function computeStructureBoundsById(structureId) {
     return { min: new THREE.Vector3(minX, minY, minZ), max: new THREE.Vector3(maxX, maxY, maxZ) };
 }
 
-function updateSkinDebug() {
-    const dbg = document.getElementById('skinDebug');
-    if (!dbg) return;
-    const layer = document.getElementById('skinOverlayLayer');
-    const rect = focusedStructure ? computeStructureScreenRect(focusedStructure.id) : null;
-    const elev = THREE.MathUtils.degToRad(DEFAULT_ISO_ELEVATION_DEG);
-    const az = THREE.MathUtils.degToRad(DEFAULT_ISO_AZIMUTH_DEG);
-    const defaultDir = new THREE.Vector3(Math.cos(elev) * Math.cos(az), Math.sin(elev), Math.cos(elev) * Math.sin(az)).normalize().negate();
-    const curDir = new THREE.Vector3();
-    camera.getWorldDirection(curDir);
-    const dot = curDir.normalize().dot(defaultDir);
-    dbg.style.display = 'block';
-    dbg.textContent = `overlay:${layer ? layer.style.display : 'n/a'} dot:${dot.toFixed(3)} rect:${rect ? `${rect.w}x${rect.h}` : 'none'} zoom:${currentZoom.toFixed(2)} skins:${skinEls.size}`;
-}
-
 function debugLog(tag, payload) {
     console.log(`[debug] ${tag}`, payload || '');
-}
-
-function toggleSkinAdjust(structureId, buttonEl) {
-    // Only allow adjusting one structure at a time
-    if (skinAdjustActive && adjustingStructureId !== structureId) {
-        // Turn off previous
-        toggleSkinAdjust(adjustingStructureId, null);
-    }
-    skinAdjustActive = !skinAdjustActive;
-    adjustingStructureId = skinAdjustActive ? structureId : null;
-    if (buttonEl) buttonEl.textContent = skinAdjustActive ? '✔' : '🎯';
-    const el = skinEls.get(structureId);
-    if (el) {
-        el.style.pointerEvents = skinAdjustActive ? 'auto' : 'none';
-        el.style.border = skinAdjustActive ? '1px dashed #00e5ff' : 'none';
-    }
-    const layer = document.getElementById('skinOverlayLayer');
-    if (!layer || !el) return;
-    if (skinAdjustActive) {
-        showToast('Adjust skin: drag to move, use corner handles to scale, click ✔ when done.', 'info');
-        lastPointer = null;
-        layer.addEventListener('pointerdown', onSkinPointerDown);
-        window.addEventListener('pointermove', onSkinPointerMove, { passive: true });
-        window.addEventListener('pointerup', onSkinPointerUp);
-        layer.addEventListener('wheel', onSkinWheel, { passive: false });
-        renderSkinGizmoHandles();
-    } else {
-        showToast('Adjustment applied', 'success');
-        layer.removeEventListener('pointerdown', onSkinPointerDown);
-        window.removeEventListener('pointermove', onSkinPointerMove);
-        window.removeEventListener('pointerup', onSkinPointerUp);
-        layer.removeEventListener('wheel', onSkinWheel);
-        clearSkinGizmoHandles();
-    }
-}
-
-function onSkinPointerDown(e) {
-    if (!skinAdjustActive) return;
-    lastPointer = { x: e.clientX, y: e.clientY };
-    try { e.target.setPointerCapture?.(e.pointerId); } catch {}
-}
-
-function onSkinPointerMove(e) {
-    if (!skinAdjustActive || !lastPointer) return;
-    const dx = e.clientX - lastPointer.x;
-    const dy = e.clientY - lastPointer.y;
-    const sid = adjustingStructureId;
-    if (!sid) return;
-    const st = skinStates.get(sid) || { x: 0, y: 0, scale: 1 };
-    st.x += dx; st.y += dy; skinStates.set(sid, st);
-    lastPointer = { x: e.clientX, y: e.clientY };
-    updateScreenOverlayTransform();
-}
-
-function onSkinPointerUp(e) {
-    lastPointer = null;
-}
-
-function onSkinWheel(e) {
-    if (!skinAdjustActive) return;
-    e.preventDefault();
-    const delta = e.deltaY;
-    const factor = Math.exp(-delta * 0.001);
-    const sid = adjustingStructureId; if (!sid) return;
-    const st = skinStates.get(sid) || { x: 0, y: 0, scale: 1 };
-    const before = st.scale;
-    st.scale = Math.max(0.1, Math.min(5, before * factor));
-    skinStates.set(sid, st);
-    debugLog('skin:scale', { from: before.toFixed(3), to: st.scale.toFixed(3), delta: (st.scale - before).toFixed(3) });
-    updateScreenOverlayTransform();
 }
 
 function showToast(message, type = 'info', timeout = 3000) {
@@ -4277,72 +4027,6 @@ function showToast(message, type = 'info', timeout = 3000) {
     setTimeout(() => {
         div.remove();
     }, timeout);
-}
-
-function renderSkinGizmoHandles() {
-    if (!skinEls.size === 0) return;
-    clearSkinGizmoHandles();
-    const add = (left, top, cursor) => {
-        const h = document.createElement('div');
-        h.className = 'skin-gizmo-handle';
-        h.style.left = left;
-        h.style.top = top;
-        if (cursor) h.style.cursor = cursor;
-        h.addEventListener('pointerdown', onSkinHandleDown);
-        skinEls.get(structureId).appendChild(h);
-        return h;
-    };
-    // four corners
-    add('-6px', '-6px', 'nwse-resize');
-    add('calc(100% - 6px)', '-6px', 'nesw-resize');
-    add('-6px', 'calc(100% - 6px)', 'nesw-resize');
-    add('calc(100% - 6px)', 'calc(100% - 6px)', 'nwse-resize');
-    const centerDot = document.createElement('div');
-    centerDot.className = 'skin-gizmo-center';
-    centerDot.style.left = 'calc(50% - 4px)';
-    centerDot.style.top = 'calc(50% - 4px)';
-    skinEls.get(structureId).appendChild(centerDot);
-}
-
-function clearSkinGizmoHandles() {
-    if (!skinEls.size === 0) return;
-    [...skinEls.values()].forEach(el => {
-        [...el.querySelectorAll('.skin-gizmo-handle,.skin-gizmo-center')].forEach(n => n.remove());
-    });
-}
-
-let activeHandle = null;
-let handleStart = null;
-function onSkinHandleDown(e) {
-    if (!skinAdjustActive) return;
-    e.stopPropagation();
-    activeHandle = e.currentTarget;
-    handleStart = { x: e.clientX, y: e.clientY, scale: skinAdjustState.scale };
-    try { activeHandle.setPointerCapture?.(e.pointerId); } catch {}
-    window.addEventListener('pointermove', onSkinHandleMove, { passive: true });
-    window.addEventListener('pointerup', onSkinHandleUp);
-}
-
-function onSkinHandleMove(e) {
-    if (!activeHandle || !handleStart) return;
-    const dx = e.clientX - handleStart.x;
-    const dy = e.clientY - handleStart.y;
-    const delta = Math.max(Math.abs(dx), Math.abs(dy));
-    const factor = 1 + delta / 300 * (dx + dy >= 0 ? 1 : -1);
-    const sid = adjustingStructureId; if (!sid) return;
-    const st = skinStates.get(sid) || { x: 0, y: 0, scale: 1 };
-    const before = st.scale;
-    st.scale = Math.max(0.1, Math.min(5, handleStart.scale * factor));
-    skinStates.set(sid, st);
-    debugLog('skin:scale', { from: before.toFixed(3), to: st.scale.toFixed(3), delta: (st.scale - before).toFixed(3) });
-    updateScreenOverlayTransform();
-}
-
-function onSkinHandleUp(e) {
-    window.removeEventListener('pointermove', onSkinHandleMove);
-    window.removeEventListener('pointerup', onSkinHandleUp);
-    activeHandle = null;
-    handleStart = null;
 }
 
 function computePCAAxesAndExtents(root) {
@@ -4726,21 +4410,33 @@ function restorePersistentState() {
             });
         }
         
-        // Restore legacy gallery (for backward compatibility)
-        if (Array.isArray(state.gallery)) {
+        // Restore legacy gallery (for backward compatibility - only if no structureGalleries data exists)
+        if (Array.isArray(state.gallery) && (!state.structureGalleries || Object.keys(state.structureGalleries).length === 0)) {
             const gallery = document.getElementById('captureGallery');
             if (gallery) gallery.innerHTML = '';
             state.gallery.forEach(it => {
                 if (it.type === 'tripo' && it.glb) {
-                    // structureId may be missing from older saves; keep undefined
-                    attachTripoResult(it.glb, undefined, it.structureId ?? null);
+                    // Check if this GLB already exists in the gallery to avoid duplicates
+                    const existing = gallery.querySelector(`.capture-item[data-glb="${it.glb}"]`);
+                    if (!existing) {
+                        // structureId may be missing from older saves; keep undefined
+                        attachTripoResult(it.glb, undefined, it.structureId ?? null);
+                    }
                 } else if (it.type === 'flux' && it.src) {
-                    // tag with structure if recorded
-                    if (it.structureId != null) { const sId = String(it.structureId); }
-                    attachFalResult(it.src);
-                    const last = gallery.firstElementChild; if (last && it.structureId != null) last.dataset.structureId = String(it.structureId);
+                    // Check if this flux result already exists
+                    const existing = gallery.querySelector(`.capture-item[data-src="${it.src}"]`);
+                    if (!existing) {
+                        // tag with structure if recorded
+                        if (it.structureId != null) { const sId = String(it.structureId); }
+                        attachFalResult(it.src);
+                        const last = gallery.firstElementChild; if (last && it.structureId != null) last.dataset.structureId = String(it.structureId);
+                    }
                 } else if (it.type === 'image' && it.src) {
-                    appendGalleryImage(it.label || 'IMAGE', it.src, it.structureId);
+                    // Check if this image already exists
+                    const existing = gallery.querySelector(`.capture-item[data-src="${it.src}"]`);
+                    if (!existing) {
+                        appendGalleryImage(it.label || 'IMAGE', it.src, it.structureId);
+                    }
                 }
             });
         }
@@ -4818,11 +4514,9 @@ function deleteStructureById(structureId) {
             const idx = voxels.indexOf(vx); if (idx >= 0) voxels.splice(idx, 1);
         });
     }
-    // Remove skins and overlay
+    // Remove skins references
     structureIdToSkinUrls.delete(structureId);
     activeSkinIndex.delete(structureId);
-    const el = skinEls.get(structureId); if (el) { el.remove(); skinEls.delete(structureId); }
-    skinStates.delete(structureId);
     // Remove gallery items with this structureId
     const gallery = document.getElementById('captureGallery');
     if (gallery) {
@@ -5999,7 +5693,6 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
     obj.updateMatrixWorld(true);
     const baseRotation = obj.rotation.y;
     let bestOrientation = 0;
-    let bestEmptySW = false;
     
     console.log('Testing orientations for missing corner placement...');
     
@@ -6102,7 +5795,6 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
         if (otherCornersNotEmpty && cornerHitCounts.Yellow < lowestYellowScore) {
             lowestYellowScore = cornerHitCounts.Yellow;
             bestOrientation = i;
-            bestEmptySW = cornerHitCounts.Yellow <= 3;  // Consider empty if 3 or fewer hits
         }
     }
     

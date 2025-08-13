@@ -443,43 +443,6 @@ body {
     display: none;
 }
 
-.skin-overlay-layer {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    pointer-events: none;
-    z-index: 100;
-}
-.skin-overlay-layer, .skin-overlay-layer * {
-    will-change: transform, left, top, width, height;
-}
-
-.skin-gizmo-handle {
-    position: absolute;
-    width: 12px;
-    height: 12px;
-    background: #00e5ff;
-    border: 2px solid #004f59;
-    border-radius: 2px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.4);
-    pointer-events: auto;
-    cursor: nwse-resize;
-    z-index: 101;
-}
-
-.skin-gizmo-center {
-    position: absolute;
-    width: 8px;
-    height: 8px;
-    background: #ffffff;
-    border: 2px solid #333;
-    border-radius: 50%;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.4);
-    pointer-events: none;
-    z-index: 101;
-}
 
 .hud-btn {
     padding: 6px 10px;
@@ -668,20 +631,18 @@ body {
     border: 1px solid #e6e6e6;
 }
 
-.skin-controls {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    margin-top: 4px;
+.copy-seed-btn {
+    padding: 6px 10px;
+    background: #28a745;
+    color: white;
+    border: 1px solid #218838;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
 }
 
-.skin-btn {
-    background: #4444ff;
-    border: 1px solid #5555ff;
-    color: #fff;
-    font-size: 10px;
-    border-radius: 3px;
-    padding: 2px 6px;
+.copy-seed-btn:hover {
+    background: #218838;
 }
 
 /* Step-by-step placement visualization */
