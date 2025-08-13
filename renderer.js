@@ -131,25 +131,16 @@ function showTransformPanel(object) {
         fitBtn.addEventListener('click', () => {
             if (!transformPanelObject) return;
             const obj = transformPanelObject;
-            // 1. Fixed rotation of -30° around Y
-            obj.rotation.y = THREE.MathUtils.degToRad(-30);
-
-            // 2. Uniform scale so that displayed segment-scale reads 2.0 ↔ world scale = 2.0 / METERS_PER_SEGMENT
-            const desiredSegScale = 2.0;
-            const worldScale = desiredSegScale / METERS_PER_SEGMENT;
-            obj.scale.set(worldScale, worldScale, worldScale);
-
-            obj.updateMatrixWorld(true);
-
-            // 3. Push down so bottom of model rests on structure ground plane (bounds.min.y)
+            
+            // Determine which structure to fit against
             const sid = obj.userData?.structureId ?? (focusedStructure && focusedStructure.id);
-            if (sid == null) { alert('No target structure to fit against'); return; }
-            const b = computeStructureBoundsById(sid);
-            if (!b) { alert('Could not compute structure bounds'); return; }
-            const box = new THREE.Box3().setFromObject(obj);
-            const deltaY = (b.min.y) - box.min.y;
-            obj.position.y += deltaY;
-            obj.updateMatrixWorld(true);
+            if (sid == null) { 
+                alert('No target structure to fit against'); 
+                return; 
+            }
+            
+            // Use the auto-align function that properly handles missing corner alignment
+            autoAlignModelToStructureFoundation(obj, sid);
             updateTransformPanel();
         });
     }
@@ -5230,28 +5221,180 @@ function createOrUpdateTreeMarker(boundsOverride = null, camForPlacement = null)
     return;
 }
 
-// Fit button
-transformPanel.querySelector('#fitBtn').addEventListener('click', () => {
-    if (!transformPanelObject) return;
-    const obj = transformPanelObject;
-    // Determine which structure to fit against: prefer the object's userData.structureId, else current focused
-    const sid = obj.userData?.structureId ?? (focusedStructure && focusedStructure.id);
-    if (sid == null) { alert('No target structure to fit against'); return; }
-    const b = computeStructureBoundsById(sid);
-    if (!b) { alert('Could not compute bounds for structure'); return; }
-    const targetSize = new THREE.Vector3(b.max.x - b.min.x, b.max.y - b.min.y, b.max.z - b.min.z);
+// Removed duplicate Fit button listener - it's properly attached in showTransformPanel()
 
-    // Current model size
-    const box = new THREE.Box3().setFromObject(obj);
-    const curSize = box.getSize(new THREE.Vector3());
-    if (curSize.x < 1e-3 || curSize.z < 1e-3) { alert('Model size is zero'); return; }
+function computeStructureFoundationInfo(structureId) {
+    // Compute foundation info for a structure, identifying the missing corner
+    const s = savedStructures.find(ss => ss.id === structureId);
+    if (!s || !s.data || s.data.length === 0) {
+        // Try to compute from focused structure voxels if available
+        if (focusedStructure && focusedStructure.id === structureId && focusedStructureVoxels.length > 0) {
+            return computeFoundationFromVoxels(focusedStructureVoxels);
+        }
+        return null;
+    }
+    
+    // Compute bounds and base Y level
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    
+    s.data.forEach(v => {
+        const p = Array.isArray(v.position) ? v.position : v.position?.toArray?.() || v.position;
+        if (!p) return;
+        const x = Math.round(p[0]);
+        const y = Math.round(p[1]);
+        const z = Math.round(p[2]);
+        minX = Math.min(minX, x); 
+        minY = Math.min(minY, y); 
+        minZ = Math.min(minZ, z);
+        maxX = Math.max(maxX, x); 
+        maxY = Math.max(maxY, y); 
+        maxZ = Math.max(maxZ, z);
+    });
+    
+    if (!isFinite(minX)) return null;
+    
+    // The foundation is at the base level (minY)
+    const baseY = minY;
+    
+    // Create occupancy map for the base level
+    const occupancy = new Set();
+    s.data.forEach(v => {
+        const p = Array.isArray(v.position) ? v.position : v.position?.toArray?.() || v.position;
+        if (!p) return;
+        const x = Math.round(p[0]);
+        const y = Math.round(p[1]);
+        const z = Math.round(p[2]);
+        
+        // Only consider voxels at or near the base level for foundation
+        if (Math.abs(y - baseY) < voxelSize * 0.5) {
+            occupancy.add(`${x}|${z}`);
+        }
+    });
+    
+    // Determine the rectangular bounds of the foundation
+    let rMinX = Infinity, rMaxX = -Infinity, rMinZ = Infinity, rMaxZ = -Infinity;
+    occupancy.forEach(key => {
+        const [x, z] = key.split('|').map(Number);
+        rMinX = Math.min(rMinX, x);
+        rMaxX = Math.max(rMaxX, x);
+        rMinZ = Math.min(rMinZ, z);
+        rMaxZ = Math.max(rMaxZ, z);
+    });
+    
+    // Check which corner is actually missing
+    const corners = [
+        { x: rMinX, z: rMinZ, name: 'SW' },
+        { x: rMinX, z: rMaxZ, name: 'NW' },
+        { x: rMaxX, z: rMinZ, name: 'SE' },
+        { x: rMaxX, z: rMaxZ, name: 'NE' }
+    ];
+    
+    let missing = null;
+    for (const corner of corners) {
+        if (!occupancy.has(`${corner.x}|${corner.z}`)) {
+            missing = { x: corner.x, z: corner.z };
+            console.log('Structure missing corner:', corner.name, 'at', corner.x, corner.z);
+            break;
+        }
+    }
+    
+    // If no corner is missing, default to NE
+    if (!missing) {
+        missing = { x: rMaxX, z: rMaxZ };
+        console.log('No missing corner detected, defaulting to NE');
+    }
+    
+    return {
+        baseY: baseY,
+        rMinX: rMinX,
+        rMaxX: rMaxX,
+        rMinZ: rMinZ,
+        rMaxZ: rMaxZ,
+        missing: missing,
+        occupancy: occupancy,
+        bounds: { min: new THREE.Vector3(minX, minY, minZ), max: new THREE.Vector3(maxX, maxY, maxZ) }
+    };
+}
 
-    // Uniform scale to match X/Z footprint (average)
-    const s = 0.5 * ((targetSize.x / curSize.x) + (targetSize.z / curSize.z));
-    obj.scale.multiplyScalar(s);
-    obj.updateMatrixWorld(true);
-    updateTransformPanel();
-});
+function computeFoundationFromVoxels(voxels) {
+    // Compute foundation info from actual voxels in the scene
+    if (!voxels || voxels.length === 0) return null;
+    
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    
+    voxels.forEach(voxel => {
+        const x = Math.round(voxel.position.x);
+        const y = Math.round(voxel.position.y);
+        const z = Math.round(voxel.position.z);
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        minZ = Math.min(minZ, z);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+        maxZ = Math.max(maxZ, z);
+    });
+    
+    if (!isFinite(minX)) return null;
+    
+    const baseY = minY;
+    const occupancy = new Set();
+    
+    voxels.forEach(voxel => {
+        const x = Math.round(voxel.position.x);
+        const y = Math.round(voxel.position.y);
+        const z = Math.round(voxel.position.z);
+        
+        if (Math.abs(y - baseY) < voxelSize * 0.5) {
+            occupancy.add(`${x}|${z}`);
+        }
+    });
+    
+    // Determine rectangular bounds
+    let rMinX = Infinity, rMaxX = -Infinity, rMinZ = Infinity, rMaxZ = -Infinity;
+    occupancy.forEach(key => {
+        const [x, z] = key.split('|').map(Number);
+        rMinX = Math.min(rMinX, x);
+        rMaxX = Math.max(rMaxX, x);
+        rMinZ = Math.min(rMinZ, z);
+        rMaxZ = Math.max(rMaxZ, z);
+    });
+    
+    // Check which corner is actually missing
+    const corners = [
+        { x: rMinX, z: rMinZ, name: 'SW' },
+        { x: rMinX, z: rMaxZ, name: 'NW' },
+        { x: rMaxX, z: rMinZ, name: 'SE' },
+        { x: rMaxX, z: rMaxZ, name: 'NE' }
+    ];
+    
+    let missing = null;
+    for (const corner of corners) {
+        if (!occupancy.has(`${corner.x}|${corner.z}`)) {
+            missing = { x: corner.x, z: corner.z };
+            console.log('Voxels missing corner:', corner.name, 'at', corner.x, corner.z);
+            break;
+        }
+    }
+    
+    // If no corner is missing, default to NE
+    if (!missing) {
+        missing = { x: rMaxX, z: rMaxZ };
+        console.log('No missing corner detected in voxels, defaulting to NE');
+    }
+    
+    return {
+        baseY: baseY,
+        rMinX: rMinX,
+        rMaxX: rMaxX,
+        rMinZ: rMinZ,
+        rMaxZ: rMaxZ,
+        missing: missing,
+        occupancy: occupancy,
+        bounds: { min: new THREE.Vector3(minX, minY, minZ), max: new THREE.Vector3(maxX, maxY, maxZ) }
+    };
+}
 
 function buildStructureFoundationCells(sInfo) {
     // Return Set of "x|z" cells occupied by the structure foundation idealization
@@ -5365,45 +5508,474 @@ function detectModelFoundationMissingCell(root, yEpsilon = 0.2) {
     return { missingX: missing.x, missingZ: missing.z, bounds: { minX, maxX, minZ, maxZ }, occupancy: occ };
 }
 
-function autoAlignModelToStructureFoundation(obj, structureId, { baseRotationDeg = -32.5 } = {}) {
+function autoAlignModelToStructureFoundation(obj, structureId) {
     const sInfo = computeStructureFoundationInfo(structureId);
-    if (!sInfo) { showToast?.('Could not compute structure foundation', 'error'); return; }
-    const original = { pos: obj.position.clone(), rot: obj.rotation.clone(), scl: obj.scale.clone() };
-
-    // Detect current model base and compute precise yaw/scale from edges
-    let mInfo0 = detectModelFoundationMissingCell(obj);
-    if (!mInfo0) { showToast?.('Could not detect model foundation', 'error'); return; }
-    const ms = { x: mInfo0.missingX, z: mInfo0.missingZ };
-    const params = computeYawAndScaleFromEdges(ms, mInfo0.bounds, sInfo);
-    if (!params) { showToast?.('Alignment failed (degenerate edges)', 'error'); return; }
-
-    // Apply rotation and scale
-    obj.rotation.y = params.theta;
-    obj.scale.copy(original.scl);
-    obj.updateMatrixWorld(true);
-
-    // Compute uniform scale to match structure footprint after rotation
-    const structW = (sInfo.rMaxX - sInfo.rMinX + 1);
-    const structD = (sInfo.rMaxZ - sInfo.rMinZ + 1);
-    const boxAfterRot = new THREE.Box3().setFromObject(obj);
-    const sizeAfterRot = boxAfterRot.getSize(new THREE.Vector3());
-    const modelW = Math.max(1e-6, sizeAfterRot.x);
-    const modelD = Math.max(1e-6, sizeAfterRot.z);
-    const scaleW = structW / modelW;
-    const scaleD = structD / modelD;
-    const uniformScale = Math.max(1e-3, 0.5 * (scaleW + scaleD));
-    obj.scale.multiplyScalar(uniformScale);
-    obj.updateMatrixWorld(true);
-
-    // Snap missing corner to NE and rest on base
-    const mInfo1 = detectModelFoundationMissingCell(obj);
-    if (mInfo1) {
-        obj.position.x += (sInfo.missing.x - mInfo1.missingX);
-        obj.position.z += (sInfo.missing.z - mInfo1.missingZ);
+    if (!sInfo) { 
+        showToast('Could not compute structure foundation', 'error'); 
+        return; 
     }
-    const box = new THREE.Box3().setFromObject(obj);
-    obj.position.y += (sInfo.baseY - box.min.y);
-    obj.updateMatrixWorld(true);
+    
+    // Store original position (we'll keep this unchanged)
+    const originalPosition = obj.position.clone();
+    
+    console.log('Structure info:', {
+        width: sInfo.rMaxX - sInfo.rMinX + 1,
+        depth: sInfo.rMaxZ - sInfo.rMinZ + 1
+    });
 
-    showToast?.('Auto-aligned to foundation', 'success');
+    // Remove any previous debug visualization
+    const oldDebug = scene.getObjectByName('alignmentDebugLine');
+    if (oldDebug) scene.remove(oldDebug);
+
+    // Find the rotation that best aligns the model's edges with X/Z axes
+    let bestRotation = 0;
+    let bestAlignmentScore = Infinity;
+    let bestAlignedAxis = 'X'; // Track which axis we're aligning to
+    let bestEdgePoints = []; // Store the edge points for visualization
+    
+    // Test rotations from -90 to 90 degrees (models shouldn't need more than this)
+    for (let angleDeg = -90; angleDeg <= 90; angleDeg += 5) {
+        const angleRad = angleDeg * Math.PI / 180;
+        
+        // Apply test rotation
+        obj.rotation.set(0, angleRad, 0);
+        obj.updateMatrixWorld(true);
+        
+        // Get the model's bounding box at this rotation
+        const box = new THREE.Box3().setFromObject(obj);
+        
+        // Sample points along the bottom of the model to detect edges
+        const samples = [];
+        const numSamples = 50; // Increased for better edge detection
+        
+        obj.traverse((child) => {
+            if (child.isMesh && child.geometry) {
+                const positions = child.geometry.attributes.position;
+                if (positions) {
+                    for (let i = 0; i < positions.count && samples.length < numSamples; i++) {
+                        const vertex = new THREE.Vector3();
+                        vertex.fromBufferAttribute(positions, i);
+                        vertex.applyMatrix4(child.matrixWorld);
+                        
+                        // Only sample points near the bottom
+                        if (Math.abs(vertex.y - box.min.y) < 0.5) {
+                            samples.push({ x: vertex.x, z: vertex.z, y: vertex.y });
+                        }
+                    }
+                }
+            }
+        });
+        
+        if (samples.length < 4) continue;
+        
+        // Check alignment with X axis (variance in Z should be minimal for aligned edges)
+        const xAlignedPoints = samples.map(p => p.z);
+        const zVariance = calculateVariance(xAlignedPoints);
+        
+        // Check alignment with Z axis (variance in X should be minimal for aligned edges)
+        const zAlignedPoints = samples.map(p => p.x);
+        const xVariance = calculateVariance(zAlignedPoints);
+        
+        // Best alignment has minimum variance perpendicular to axes
+        const alignmentScore = Math.min(xVariance, zVariance);
+        
+        if (alignmentScore < bestAlignmentScore) {
+            bestAlignmentScore = alignmentScore;
+            bestRotation = angleRad;
+            bestAlignedAxis = xVariance < zVariance ? 'Z' : 'X';
+            bestEdgePoints = [...samples]; // Store the samples for this rotation
+        }
+    }
+    
+    // Fine-tune the rotation with smaller steps
+    const startAngle = bestRotation - 5 * Math.PI / 180;
+    const endAngle = bestRotation + 5 * Math.PI / 180;
+    
+    // Use smaller step size for fine-tuning (0.5 degrees)
+    for (let angleRad = startAngle; angleRad <= endAngle; angleRad += Math.PI / 360) {
+        obj.rotation.set(0, angleRad, 0);
+        obj.updateMatrixWorld(true);
+        
+        const box = new THREE.Box3().setFromObject(obj);
+        const samples = [];
+        const numSamples = 50;
+        
+        obj.traverse((child) => {
+            if (child.isMesh && child.geometry) {
+                const positions = child.geometry.attributes.position;
+                if (positions) {
+                    for (let i = 0; i < positions.count && samples.length < numSamples; i++) {
+                        const vertex = new THREE.Vector3();
+                        vertex.fromBufferAttribute(positions, i);
+                        vertex.applyMatrix4(child.matrixWorld);
+                        
+                        if (Math.abs(vertex.y - box.min.y) < 0.5) {
+                            samples.push({ x: vertex.x, z: vertex.z, y: vertex.y });
+                        }
+                    }
+                }
+            }
+        });
+        
+        if (samples.length < 4) continue;
+        
+        const xAlignedPoints = samples.map(p => p.z);
+        const zVariance = calculateVariance(xAlignedPoints);
+        const zAlignedPoints = samples.map(p => p.x);
+        const xVariance = calculateVariance(zAlignedPoints);
+        const alignmentScore = Math.min(xVariance, zVariance);
+        
+        if (alignmentScore < bestAlignmentScore) {
+            bestAlignmentScore = alignmentScore;
+            bestRotation = angleRad;
+            bestAlignedAxis = xVariance < zVariance ? 'Z' : 'X';
+            bestEdgePoints = [...samples];
+        }
+    }
+    
+    console.log('Best rotation found:', bestRotation * 180 / Math.PI, 'degrees');
+    console.log('Aligning edge to axis:', bestAlignedAxis);
+    
+    // Apply the best rotation
+    obj.rotation.y = bestRotation;
+    obj.updateMatrixWorld(true);
+    
+    // Do a final pass to verify and correct any small misalignment
+    // Sample the current position after best rotation
+    const finalBox = new THREE.Box3().setFromObject(obj);
+    const finalSamples = [];
+    
+    obj.traverse((child) => {
+        if (child.isMesh && child.geometry) {
+            const positions = child.geometry.attributes.position;
+            if (positions) {
+                for (let i = 0; i < positions.count && finalSamples.length < 100; i++) {
+                    const vertex = new THREE.Vector3();
+                    vertex.fromBufferAttribute(positions, i);
+                    vertex.applyMatrix4(child.matrixWorld);
+                    
+                    if (Math.abs(vertex.y - finalBox.min.y) < 0.5) {
+                        finalSamples.push({ x: vertex.x, z: vertex.z, y: vertex.y });
+                    }
+                }
+            }
+        }
+    });
+    
+    // Find the most prominent edge and align it perfectly
+    if (finalSamples.length > 10) {
+        // Find the bounding box of the samples
+        const xMin = Math.min(...finalSamples.map(p => p.x));
+        const xMax = Math.max(...finalSamples.map(p => p.x));
+        const zMin = Math.min(...finalSamples.map(p => p.z));
+        const zMax = Math.max(...finalSamples.map(p => p.z));
+        
+        const xRange = xMax - xMin;
+        const zRange = zMax - zMin;
+        
+        // Find the two most extreme points to define the main edge
+        let edgeStart, edgeEnd;
+        
+        if (xRange > zRange) {
+            // Edge runs mostly along X - find leftmost and rightmost points
+            finalSamples.sort((a, b) => a.x - b.x);
+            edgeStart = finalSamples[0];
+            edgeEnd = finalSamples[finalSamples.length - 1];
+            bestAlignedAxis = 'X';
+        } else {
+            // Edge runs mostly along Z - find frontmost and backmost points
+            finalSamples.sort((a, b) => a.z - b.z);
+            edgeStart = finalSamples[0];
+            edgeEnd = finalSamples[finalSamples.length - 1];
+            bestAlignedAxis = 'Z';
+        }
+        
+        // Calculate the angle of this edge in the XZ plane
+        const dx = edgeEnd.x - edgeStart.x;
+        const dz = edgeEnd.z - edgeStart.z;
+        const currentAngle = Math.atan2(dz, dx);
+        
+        // Calculate how much to rotate to align with the target axis
+        let targetAngle;
+        if (bestAlignedAxis === 'X') {
+            // We want the edge to be at 0° (along positive X) or 180° (along negative X)
+            // Choose the closest one
+            if (Math.abs(currentAngle) < Math.PI / 2) {
+                targetAngle = 0; // Align with positive X
+            } else {
+                targetAngle = Math.PI; // Align with negative X
+            }
+        } else {
+            // We want the edge to be at 90° (along positive Z) or -90° (along negative Z)
+            if (currentAngle > 0) {
+                targetAngle = Math.PI / 2; // Align with positive Z
+            } else {
+                targetAngle = -Math.PI / 2; // Align with negative Z
+            }
+        }
+        
+        const rotationCorrection = targetAngle - currentAngle;
+        
+        console.log('Edge detection:', {
+            currentAngle: currentAngle * 180 / Math.PI,
+            targetAngle: targetAngle * 180 / Math.PI,
+            correction: rotationCorrection * 180 / Math.PI,
+            axis: bestAlignedAxis
+        });
+        
+        // Apply the rotation correction
+        if (Math.abs(rotationCorrection) > Math.PI / 720) { // More than 0.25 degrees
+            console.log('Applying rotation correction:', rotationCorrection * 180 / Math.PI, 'degrees');
+            obj.rotation.y += rotationCorrection;
+            obj.updateMatrixWorld(true);
+        }
+    }
+    
+    // Visualize the detected edge with a red line AFTER final adjustment
+    if (finalSamples.length > 0) {
+        // Recalculate samples after correction
+        const correctedSamples = [];
+        const correctedBox = new THREE.Box3().setFromObject(obj);
+        
+        obj.traverse((child) => {
+            if (child.isMesh && child.geometry) {
+                const positions = child.geometry.attributes.position;
+                if (positions) {
+                    for (let i = 0; i < positions.count && correctedSamples.length < 50; i++) {
+                        const vertex = new THREE.Vector3();
+                        vertex.fromBufferAttribute(positions, i);
+                        vertex.applyMatrix4(child.matrixWorld);
+                        
+                        if (Math.abs(vertex.y - correctedBox.min.y) < 0.5) {
+                            correctedSamples.push({ x: vertex.x, z: vertex.z, y: vertex.y });
+                        }
+                    }
+                }
+            }
+        });
+        
+        // Find the extreme points along the aligned axis
+        let minPoint, maxPoint;
+        
+        if (bestAlignedAxis === 'X') {
+            // Edge is aligned with X axis, find min and max X points
+            correctedSamples.sort((a, b) => a.x - b.x);
+            minPoint = correctedSamples[0];
+            maxPoint = correctedSamples[correctedSamples.length - 1];
+        } else {
+            // Edge is aligned with Z axis, find min and max Z points
+            correctedSamples.sort((a, b) => a.z - b.z);
+            minPoint = correctedSamples[0];
+            maxPoint = correctedSamples[correctedSamples.length - 1];
+        }
+        
+        // Create a red line to show the detected edge
+        const points = [
+            new THREE.Vector3(minPoint.x, minPoint.y, minPoint.z),
+            new THREE.Vector3(maxPoint.x, maxPoint.y, maxPoint.z)
+        ];
+        
+        const geometry = new THREE.BufferGeometry().setFromPoints(points);
+        const material = new THREE.LineBasicMaterial({ 
+            color: 0xff0000, 
+            linewidth: 3,
+            depthTest: false,
+            depthWrite: false
+        });
+        const line = new THREE.Line(geometry, material);
+        line.name = 'alignmentDebugLine';
+        scene.add(line);
+        
+        // Also add spheres at the endpoints for clarity
+        const sphereGeometry = new THREE.SphereGeometry(0.2, 16, 16);
+        const sphereMaterial = new THREE.MeshBasicMaterial({ 
+            color: 0xff0000,
+            depthTest: false,
+            depthWrite: false
+        });
+        
+        const sphere1 = new THREE.Mesh(sphereGeometry, sphereMaterial);
+        sphere1.position.copy(points[0]);
+        line.add(sphere1);
+        
+        const sphere2 = new THREE.Mesh(sphereGeometry, sphereMaterial);
+        sphere2.position.copy(points[1]);
+        line.add(sphere2);
+        
+        // Add reference axis lines to show what we're aligning to
+        const axisGroup = new THREE.Group();
+        axisGroup.name = 'axisDebugLines';
+        
+        // Get bounds for axis lines
+        const xMin = Math.min(...correctedSamples.map(p => p.x));
+        const xMax = Math.max(...correctedSamples.map(p => p.x));
+        const zMin = Math.min(...correctedSamples.map(p => p.z));
+        const zMax = Math.max(...correctedSamples.map(p => p.z));
+        
+        // X-axis line (green)
+        const xAxisGeometry = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(xMin - 2, minPoint.y, minPoint.z),
+            new THREE.Vector3(xMax + 2, minPoint.y, minPoint.z)
+        ]);
+        const xAxisMaterial = new THREE.LineBasicMaterial({ 
+            color: 0x00ff00, 
+            linewidth: 2,
+            depthTest: false,
+            depthWrite: false
+        });
+        const xAxisLine = new THREE.Line(xAxisGeometry, xAxisMaterial);
+        axisGroup.add(xAxisLine);
+        
+        // Z-axis line (blue)
+        const zAxisGeometry = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(minPoint.x, minPoint.y, zMin - 2),
+            new THREE.Vector3(minPoint.x, minPoint.y, zMax + 2)
+        ]);
+        const zAxisMaterial = new THREE.LineBasicMaterial({ 
+            color: 0x0000ff, 
+            linewidth: 2,
+            depthTest: false,
+            depthWrite: false
+        });
+        const zAxisLine = new THREE.Line(zAxisGeometry, zAxisMaterial);
+        axisGroup.add(zAxisLine);
+        
+        scene.add(axisGroup);
+        
+        // Calculate angle between red line and axis
+        const edgeDx = maxPoint.x - minPoint.x;
+        const edgeDz = maxPoint.z - minPoint.z;
+        const edgeAngle = Math.atan2(edgeDz, edgeDx) * 180 / Math.PI;
+        
+        let angleFromAxis;
+        if (bestAlignedAxis === 'X') {
+            angleFromAxis = edgeAngle; // Angle from X-axis (0°)
+        } else {
+            angleFromAxis = edgeAngle - 90; // Angle from Z-axis (90°)
+        }
+        
+        // Apply the final correction to achieve perfect alignment!
+        console.log('Edge angle:', edgeAngle, 'degrees from horizontal');
+        console.log('Angle from target axis:', angleFromAxis, 'degrees');
+        
+        if (Math.abs(angleFromAxis) > 0.1) { // If more than 0.1 degrees off
+            // Flipping the sign - if it was going the wrong way, this should fix it
+            const correctionDegrees = angleFromAxis; // POSITIVE angleFromAxis
+            const correctionRadians = correctionDegrees * Math.PI / 180;
+            console.log('Applying rotation correction:', correctionDegrees, 'degrees');
+            obj.rotation.y += correctionRadians; // Apply the correction
+            obj.updateMatrixWorld(true);
+            
+            // Recalculate the red line position after correction
+            const finalCorrectedSamples = [];
+            const finalCorrectedBox = new THREE.Box3().setFromObject(obj);
+            
+            obj.traverse((child) => {
+                if (child.isMesh && child.geometry) {
+                    const positions = child.geometry.attributes.position;
+                    if (positions) {
+                        for (let i = 0; i < positions.count && finalCorrectedSamples.length < 50; i++) {
+                            const vertex = new THREE.Vector3();
+                            vertex.fromBufferAttribute(positions, i);
+                            vertex.applyMatrix4(child.matrixWorld);
+                            
+                            if (Math.abs(vertex.y - finalCorrectedBox.min.y) < 0.5) {
+                                finalCorrectedSamples.push({ x: vertex.x, z: vertex.z, y: vertex.y });
+                            }
+                        }
+                    }
+                }
+            });
+            
+            // Update the red line to show the corrected position
+            if (finalCorrectedSamples.length > 0) {
+                let newMinPoint, newMaxPoint;
+                
+                if (bestAlignedAxis === 'X') {
+                    finalCorrectedSamples.sort((a, b) => a.x - b.x);
+                    newMinPoint = finalCorrectedSamples[0];
+                    newMaxPoint = finalCorrectedSamples[finalCorrectedSamples.length - 1];
+                } else {
+                    finalCorrectedSamples.sort((a, b) => a.z - b.z);
+                    newMinPoint = finalCorrectedSamples[0];
+                    newMaxPoint = finalCorrectedSamples[finalCorrectedSamples.length - 1];
+                }
+                
+                // Update the red line geometry
+                const newPoints = [
+                    new THREE.Vector3(newMinPoint.x, newMinPoint.y, newMinPoint.z),
+                    new THREE.Vector3(newMaxPoint.x, newMaxPoint.y, newMaxPoint.z)
+                ];
+                
+                line.geometry.setFromPoints(newPoints);
+                sphere1.position.copy(newPoints[0]);
+                sphere2.position.copy(newPoints[1]);
+            }
+            
+            angleFromAxis = 0; // Should now be perfectly aligned
+        }
+        
+        // Add text to show which axis
+        console.log(`Red line shows edge aligned to ${bestAlignedAxis} axis`);
+        console.log('Final rotation:', obj.rotation.y * 180 / Math.PI, 'degrees');
+        console.log('Edge angle from axis after correction:', angleFromAxis, 'degrees');
+        showToast(`Edge perfectly aligned to ${bestAlignedAxis} axis!`, 'success');
+        
+        // Remove the debug visualization after 5 seconds
+        setTimeout(() => {
+            const debugLine = scene.getObjectByName('alignmentDebugLine');
+            if (debugLine) scene.remove(debugLine);
+            const axisLines = scene.getObjectByName('axisDebugLines');
+            if (axisLines) scene.remove(axisLines);
+        }, 5000);
+    }
+    
+    // Now scale the model to match structure footprint
+    // Compute structure dimensions (in voxel units)
+    const structWidth = sInfo.rMaxX - sInfo.rMinX + 1;
+    const structDepth = sInfo.rMaxZ - sInfo.rMinZ + 1;
+    
+    // Get current model bounding box after rotation
+    const modelBox = new THREE.Box3().setFromObject(obj);
+    const modelSize = modelBox.getSize(new THREE.Vector3());
+    
+    // Compute scale to match structure footprint
+    // Average the X and Z scales for uniform scaling
+    const scaleX = structWidth / modelSize.x;
+    const scaleZ = structDepth / modelSize.z;
+    const uniformScale = (scaleX + scaleZ) / 2;
+    
+    console.log('Scaling:', { scaleX, scaleZ, uniformScale });
+    
+    // Apply uniform scale
+    obj.scale.multiplyScalar(uniformScale);
+    
+    // Keep the original position (centered on structure)
+    obj.position.copy(originalPosition);
+    
+    // Adjust Y position to rest on structure base
+    obj.updateMatrixWorld(true);
+    const adjustedBox = new THREE.Box3().setFromObject(obj);
+    const offsetY = sInfo.baseY - adjustedBox.min.y;
+    obj.position.y = originalPosition.y + offsetY;
+    
+    obj.updateMatrixWorld(true);
+    
+    console.log('Final transform:', {
+        rotation: obj.rotation.y * 180 / Math.PI,
+        scale: obj.scale.x,
+        position: obj.position
+    });
+    
+    showToast('Model aligned to structure', 'success');
 }
+
+// Helper function to calculate variance of an array of numbers
+function calculateVariance(values) {
+    if (values.length === 0) return Infinity;
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const variance = values.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / values.length;
+    return variance;
+}
+
+// Removed helper function - no longer needed with rotation search approach
