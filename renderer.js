@@ -1638,12 +1638,8 @@ function reattachGalleryEventListeners() {
                 const btn = e.target;
                 if (btn.dataset.action === 'place') {
                     const sid = structureId != null ? structureId : (focusedStructure && focusedStructure.id);
-                    const useVisualization = document.getElementById('enablePlacementVisualization')?.checked;
-                    if (useVisualization) {
-                        await enableTripoPlacementWithVisualization(glbUrl, sid);
-                    } else {
-                        await enableTripoPlacement(glbUrl, sid);
-                    }
+                    // Direct placement without step-by-step visualization
+                    await enableTripoPlacement(glbUrl, sid);
                     btn.textContent = 'Remove';
                     btn.dataset.action = 'remove';
                     btn.style.background = '#f44336';
@@ -3398,12 +3394,8 @@ function attachTripoResult(glbUrl, previewUrl, sourceStructureId = null) {
     placeBtn.addEventListener('click', async (e) => {
         const btn = e.target;
         if (btn.dataset.action === 'place') {
-            const useVisualization = document.getElementById('enablePlacementVisualization')?.checked;
-            if (useVisualization) {
-                await enableTripoPlacementWithVisualization(glbUrl, sourceStructureId || (focusedStructure && focusedStructure.id));
-            } else {
-                await enableTripoPlacement(glbUrl, sourceStructureId || (focusedStructure && focusedStructure.id));
-            }
+            // Direct placement without step-by-step visualization
+            await enableTripoPlacement(glbUrl, sourceStructureId || (focusedStructure && focusedStructure.id));
             btn.textContent = 'Remove';
             btn.dataset.action = 'remove';
             btn.style.background = '#f44336';
@@ -4824,7 +4816,7 @@ function deleteStructureById(structureId) {
     showToast('Structure deleted', 'success');
 }
 
-// Step-by-step placement visualization system
+// Step-by-step placement visualization system (DEPRECATED - TO BE REMOVED)
 class PlacementVisualizer {
     constructor() {
         this.steps = [];
@@ -5982,88 +5974,78 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
     // Keep the original position (centered on structure)
     obj.position.copy(originalPosition);
     
-    // Now test 4 cardinal rotations to find which one leaves SW corner most exposed
+    // Now test 4 cardinal rotations to find which one leaves SW corner empty
     obj.updateMatrixWorld(true);
     const baseRotation = obj.rotation.y;
     let bestOrientation = 0;
-    let minSWCoverage = Infinity;
-    let bestScore = -Infinity;
+    let bestEmptySW = false;
     
     console.log('Testing orientations for missing corner placement...');
+    
+    // Define corner regions at structure's outer corners (where missing voxels would be)
+    const voxelSize = 1.0;
+    const corners = {
+        SW: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize, 
+              minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
+        SE: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX, 
+              minZ: sInfo.rMaxZ, maxZ: sInfo.rMaxZ + voxelSize },
+        NW: { minX: sInfo.rMaxX, maxX: sInfo.rMaxX + voxelSize, 
+              minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ },
+        NE: { minX: sInfo.rMinX - voxelSize, maxX: sInfo.rMinX, 
+              minZ: sInfo.rMinZ - voxelSize, maxZ: sInfo.rMinZ }
+    };
+    
+    const raycaster = new THREE.Raycaster();
+    const yTolerance = 0.5;
     
     for (let i = 0; i < 4; i++) {
         const testRotation = baseRotation + (i * Math.PI / 2);
         obj.rotation.y = testRotation;
         obj.updateMatrixWorld(true);
         
-        // Get model bounding box for this rotation
-        const testBox = new THREE.Box3().setFromObject(obj);
+        // Check if each corner contains geometry using raycasting
+        let cornerStatus = { SW: false, SE: false, NW: false, NE: false };
         
-        // Define corner regions (using structure bounds as reference)
-        const cornerSize = 1.5; // Size of corner region to check
-        const corners = {
-            SW: { minX: sInfo.rMinX, maxX: sInfo.rMinX + cornerSize, minZ: sInfo.rMinZ, maxZ: sInfo.rMinZ + cornerSize },
-            SE: { minX: sInfo.rMaxX - cornerSize, maxX: sInfo.rMaxX, minZ: sInfo.rMinZ, maxZ: sInfo.rMinZ + cornerSize },
-            NW: { minX: sInfo.rMinX, maxX: sInfo.rMinX + cornerSize, minZ: sInfo.rMaxZ - cornerSize, maxZ: sInfo.rMaxZ },
-            NE: { minX: sInfo.rMaxX - cornerSize, maxX: sInfo.rMaxX, minZ: sInfo.rMaxZ - cornerSize, maxZ: sInfo.rMaxZ }
-        };
-        
-        // Count vertices in ALL corner regions
-        let cornerCounts = { SW: 0, SE: 0, NW: 0, NE: 0 };
-        const yTolerance = 0.5; // Only check near the base
-        const maxSamples = 1000; // Limit sampling for performance
-        let sampleCount = 0;
-        
-        obj.traverse((child) => {
-            if (child.isMesh && child.geometry) {
-                const positions = child.geometry.attributes.position;
-                if (positions) {
-                    // Sample vertices evenly (skip some if there are too many)
-                    const step = Math.max(1, Math.floor(positions.count / maxSamples));
-                    
-                    for (let j = 0; j < positions.count && sampleCount < maxSamples; j += step) {
-                        const vertex = new THREE.Vector3();
-                        vertex.fromBufferAttribute(positions, j);
-                        vertex.applyMatrix4(child.matrixWorld);
-                        sampleCount++;
-                        
-                        // Check if vertex is near base level
-                        if (Math.abs(vertex.y - testBox.min.y) < yTolerance) {
-                            // Check each corner
-                            if (vertex.x >= corners.SW.minX && vertex.x <= corners.SW.maxX &&
-                                vertex.z >= corners.SW.minZ && vertex.z <= corners.SW.maxZ) {
-                                cornerCounts.SW++;
-                            }
-                            if (vertex.x >= corners.SE.minX && vertex.x <= corners.SE.maxX &&
-                                vertex.z >= corners.SE.minZ && vertex.z <= corners.SE.maxZ) {
-                                cornerCounts.SE++;
-                            }
-                            if (vertex.x >= corners.NW.minX && vertex.x <= corners.NW.maxX &&
-                                vertex.z >= corners.NW.minZ && vertex.z <= corners.NW.maxZ) {
-                                cornerCounts.NW++;
-                            }
-                            if (vertex.x >= corners.NE.minX && vertex.x <= corners.NE.maxX &&
-                                vertex.z >= corners.NE.minZ && vertex.z <= corners.NE.maxZ) {
-                                cornerCounts.NE++;
-                            }
-                        }
+        Object.keys(corners).forEach(cornerName => {
+            const corner = corners[cornerName];
+            
+            // Test multiple points within the corner region
+            const testPoints = [
+                { x: corner.minX + 0.1, z: corner.minZ + 0.1 },
+                { x: corner.maxX - 0.1, z: corner.minZ + 0.1 },
+                { x: corner.minX + 0.1, z: corner.maxZ - 0.1 },
+                { x: corner.maxX - 0.1, z: corner.maxZ - 0.1 },
+                { x: (corner.minX + corner.maxX) / 2, z: (corner.minZ + corner.maxZ) / 2 }
+            ];
+            
+            // Cast rays downward to check for geometry
+            for (const point of testPoints) {
+                raycaster.set(
+                    new THREE.Vector3(point.x, sInfo.baseY + 2, point.z),
+                    new THREE.Vector3(0, -1, 0)
+                );
+                
+                const intersects = raycaster.intersectObject(obj, true);
+                
+                // Check if any intersection is near the base level
+                for (const hit of intersects) {
+                    if (Math.abs(hit.point.y - sInfo.baseY) < yTolerance) {
+                        cornerStatus[cornerName] = true;
+                        break;
                     }
                 }
+                
+                if (cornerStatus[cornerName]) break;
             }
         });
         
-        // Calculate score: maximize coverage in other corners, minimize in SW
-        // Higher score is better
-        const otherCornersTotal = cornerCounts.SE + cornerCounts.NW + cornerCounts.NE;
-        const score = otherCornersTotal - (cornerCounts.SW * 3); // Heavily penalize SW coverage
+        console.log(`Rotation ${i * 90}°: SW=${cornerStatus.SW ? '■' : '□'}, SE=${cornerStatus.SE ? '■' : '□'}, NW=${cornerStatus.NW ? '■' : '□'}, NE=${cornerStatus.NE ? '■' : '□'}`);
         
-        console.log(`Rotation ${i * 90}°: SW=${cornerCounts.SW}, SE=${cornerCounts.SE}, NW=${cornerCounts.NW}, NE=${cornerCounts.NE}, Score=${score}`);
-        
-        if (cornerCounts.SW < minSWCoverage || 
-            (cornerCounts.SW === minSWCoverage && score > bestScore)) {
-            minSWCoverage = cornerCounts.SW;
+        // Best orientation is the one with SW corner empty and others filled
+        if (!cornerStatus.SW && (cornerStatus.SE || cornerStatus.NW || cornerStatus.NE)) {
             bestOrientation = i;
-            bestScore = score;
+            bestEmptySW = true;
+            break; // Found ideal orientation
         }
     }
     
@@ -6072,17 +6054,17 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
     obj.rotation.y = finalRotation;
     obj.updateMatrixWorld(true);
     
-    console.log(`Selected orientation: ${bestOrientation * 90}° rotation (SW coverage: ${minSWCoverage}, best score: ${bestScore})`);
+    console.log(`Selected orientation: ${bestOrientation * 90}° rotation (SW corner ${bestEmptySW ? 'empty' : 'not ideal'})`);
     
-    // Add a temporary visual indicator for the SW corner
+    // Add a temporary visual indicator for the SW corner (at max X, max Z)
     const swIndicator = new THREE.Mesh(
-        new THREE.BoxGeometry(0.3, 0.3, 0.3),
-        new THREE.MeshBasicMaterial({ color: 0x00ff00, transparent: true, opacity: 0.7 })
+        new THREE.BoxGeometry(1, 1, 1),
+        new THREE.MeshBasicMaterial({ color: 0xffff00, transparent: true, opacity: 0.3 })
     );
     swIndicator.position.set(
-        sInfo.rMinX + 0.5,
+        sInfo.rMaxX + 0.5,
         sInfo.baseY,
-        sInfo.rMinZ + 0.5
+        sInfo.rMaxZ + 0.5
     );
     swIndicator.name = 'swCornerIndicator';
     scene.add(swIndicator);
