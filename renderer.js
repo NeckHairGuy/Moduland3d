@@ -5743,22 +5743,23 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
         if (axisLines) scene.remove(axisLines);
     }, 5000);
     
-    // Now scale the model to match structure footprint
-    // Compute structure dimensions (in voxel units)
-    const structWidth = sInfo.rMaxX - sInfo.rMinX + 1;
-    const structDepth = sInfo.rMaxZ - sInfo.rMinZ + 1;
+    // Now scale the model to match structure HEIGHT
+    // Compute structure height (in voxel units)
+    const structBounds = sInfo.bounds;
+    const structHeight = structBounds.max.y - structBounds.min.y + 1;
     
     // Get current model bounding box after rotation
     const modelBox = new THREE.Box3().setFromObject(obj);
     const modelSize = modelBox.getSize(new THREE.Vector3());
     
-    // Compute scale to match structure footprint
-    // Average the X and Z scales for uniform scaling
-    const scaleX = structWidth / modelSize.x;
-    const scaleZ = structDepth / modelSize.z;
-    const uniformScale = (scaleX + scaleZ) / 2;
+    // Compute scale based on Y dimension (height)
+    const uniformScale = structHeight / modelSize.y;
     
-    console.log('Scaling:', { scaleX, scaleZ, uniformScale });
+    console.log('Scaling based on height:', {
+        structureHeight: structHeight,
+        modelHeight: modelSize.y,
+        scale: uniformScale
+    });
     
     // Apply uniform scale
     obj.scale.multiplyScalar(uniformScale);
@@ -5769,7 +5770,21 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
     // Adjust Y position to rest on structure base
     obj.updateMatrixWorld(true);
     const adjustedBox = new THREE.Box3().setFromObject(obj);
-    const offsetY = sInfo.baseY - adjustedBox.min.y;
+    
+    console.log('Y-position debug:', {
+        structureBaseY: sInfo.baseY,
+        modelBottomY: adjustedBox.min.y,
+        voxelSize: voxelSize,
+        originalY: originalPosition.y
+    });
+    
+    // The model bottom should align with the structure base
+    // Since voxels are centered at integer positions, and voxelSize is 1,
+    // the bottom of a voxel at position Y is at Y - 0.5
+    const targetY = sInfo.baseY - voxelSize / 2;  // Bottom face of the base voxel
+    const currentModelBottom = adjustedBox.min.y;
+    const offsetY = targetY - currentModelBottom;
+    
     obj.position.y = originalPosition.y + offsetY;
     
     obj.updateMatrixWorld(true);
@@ -5783,12 +5798,4 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
     showToast('Model aligned to structure', 'success');
 }
 
-// Helper function to calculate variance of an array of numbers
-function calculateVariance(values) {
-    if (values.length === 0) return Infinity;
-    const mean = values.reduce((a, b) => a + b, 0) / values.length;
-    const variance = values.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / values.length;
-    return variance;
-}
-
-// Removed helper function - no longer needed with rotation search approach
+// Removed helper functions - no longer needed with bounding box approach
