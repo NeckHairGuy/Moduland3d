@@ -99,6 +99,10 @@ function showTransformPanel(object) {
                 <div>NW: <span id="nwScore">-</span></div>
                 <div>NE: <span id="neScore">-</span></div>
             </div>
+            <div style="margin-top:10px;display:flex;gap:5px;">
+                <button id="doneBtn" style="flex:1;padding:6px;background:#28a745;color:white;border:none;border-radius:3px;cursor:pointer;">Done</button>
+                <button id="removeBtn" style="flex:1;padding:6px;background:#dc3545;color:white;border:none;border-radius:3px;cursor:pointer;">Remove</button>
+            </div>
         `;
         document.body.appendChild(transformPanel);
 
@@ -167,6 +171,62 @@ function showTransformPanel(object) {
             transformPanelObject.updateMatrixWorld(true);
             updateTransformPanel();
             updateCornerScores();
+        });
+        
+        // Add Done button listener
+        const doneBtn = transformPanel.querySelector('#doneBtn');
+        doneBtn.addEventListener('click', () => {
+            if (!transformPanelObject) return;
+            // Just close the transform controls without removing the model
+            detachTripoTransformControls();
+            // Clear corner test regions
+            ['swCornerHighlight', 'cornerTestRegions'].forEach(name => {
+                const highlight = scene.getObjectByName(name);
+                if (highlight) scene.remove(highlight);
+            });
+        });
+        
+        // Add Remove button listener
+        const removeBtn = transformPanel.querySelector('#removeBtn');
+        removeBtn.addEventListener('click', () => {
+            if (!transformPanelObject) return;
+            const structureId = transformPanelObject.userData?.structureId;
+            
+            // Remove the model from scene
+            if (transformPanelObject.parent) {
+                transformPanelObject.parent.remove(transformPanelObject);
+            }
+            scene.remove(transformPanelObject);
+            
+            // Clean up model data
+            transformPanelObject.traverse(child => {
+                if (child.geometry) child.geometry.dispose();
+                if (child.material) {
+                    if (Array.isArray(child.material)) {
+                        child.material.forEach(m => m.dispose());
+                    } else {
+                        child.material.dispose();
+                    }
+                }
+            });
+            
+            // Remove from tracking
+            if (structureId) {
+                placedModelsByStructure.delete(structureId);
+            }
+            
+            // Clear references
+            if (tripoModelGroup === transformPanelObject) {
+                tripoModelGroup = null;
+            }
+            
+            // Close transform controls
+            detachTripoTransformControls();
+            
+            // Update structures menu to reflect model removal
+            updateStructuresMenu();
+            
+            persistStateIfEnabled();
         });
     }
     updateTransformPanel();
@@ -2644,6 +2704,9 @@ function updateStructuresMenu() {
         const item = document.createElement('div');
         item.className = 'structure-item';
         const hasSkins = (structureIdToSkinUrls.get(structure.id)?.length || 0) > 0;
+        // Check if this structure has a placed model
+        const hasModel = placedModelsByStructure.has(structure.id);
+        
         item.innerHTML = `
             <div class="structure-preview" style="position:relative;"></div>
             <div class="structure-name" style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
@@ -2653,6 +2716,11 @@ function updateStructuresMenu() {
                     <button class="structure-delete" title="Delete" style="font-size:12px; padding:2px 6px;">🗑</button>
                 </div>
             </div>
+            ${hasModel ? `
+            <div class="model-controls" style="display:flex; align-items:center; gap:4px; margin-top:4px;">
+                <button class="model-adjust" style="flex:1; padding:2px 6px; background:#4444ff; color:white; border:none; border-radius:3px; font-size:11px;">Adjust GLB</button>
+            </div>
+            ` : ''}
         `;
         item.addEventListener('click', () => loadStructure(structure));
         
@@ -2665,6 +2733,21 @@ function updateStructuresMenu() {
         
         const delBtn = item.querySelector('.structure-delete');
         delBtn.addEventListener('click', (e) => { e.stopPropagation(); deleteStructureById(structure.id); });
+        
+        // Model adjust button
+        if (hasModel) {
+            const adjustBtn = item.querySelector('.model-adjust');
+            adjustBtn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const modelData = placedModelsByStructure.get(structure.id);
+                if (modelData && modelData.group) {
+                    // Re-attach transform controls to this model
+                    await attachTripoTransformControls(modelData.group);
+                    showTransformPanel(modelData.group);
+                }
+            });
+        }
+        
         list.appendChild(item);
     });
     persistStateIfEnabled();
@@ -3497,6 +3580,7 @@ async function enableTripoPlacement(glbUrl, structureId = null) {
     tripoPlacementEnabled = true;
     if (structureId) {
         placedModelsByStructure.set(structureId, { group: gltfRoot, glbUrl });
+        updateStructuresMenu(); // Update menu to show the adjust button
     }
     persistStateIfEnabled?.();
     return; // Skip legacy automatic placement logic
@@ -5002,6 +5086,7 @@ Model placement complete! The model is now:
             group: this.modelGroup,
             glbUrl: this.glbUrl
         });
+        updateStructuresMenu(); // Update menu to show the adjust button
         
         // Set as active model if this is for the focused structure
         if (focusedStructure && this.structureId === focusedStructure.id) {
@@ -5857,6 +5942,12 @@ function autoAlignModelToStructureFoundation(obj, structureId) {
         rotation: obj.rotation.y * 180 / Math.PI,
         scale: obj.scale.x,
         position: obj.position
+    });
+    
+    // Clean up corner test regions after alignment is complete
+    ['swCornerHighlight', 'cornerTestRegions'].forEach(name => {
+        const highlight = scene.getObjectByName(name);
+        if (highlight) scene.remove(highlight);
     });
     
     showToast('Model aligned to structure', 'success');
